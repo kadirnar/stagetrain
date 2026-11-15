@@ -1,136 +1,127 @@
-# Single-label topic classifier, every stage kind of the track:
+# The accuracy recipe for a single-label encoder classifier. Every stage is here because the
+# evidence in docs/research/classifiers.md says it pays for itself.
 #
-#   data -> adapt -> teacher -> teacher_calibration -> pseudo -> student -> calibration -> test -> export
+#   data ─┬─> baseline (TF-IDF + logistic regression: the bar)
+#         ├─> adapt (masked-LM on in-domain text)
+#         └─> finetune x18 = {plain, adapted encoder} x {3 learning rates} x {3 seeds}
+#                  └─> best (by the mean over seeds) ──> calibration ──> test (paired against the baseline) ──> export
+#
+#   stagetrain plan   configs/classifiers/modernbert-agnews.yaml
+#   stagetrain run    configs/classifiers/modernbert-agnews.yaml
+#   stagetrain report configs/classifiers/modernbert-agnews.yaml --open
 #
 # AG News stands in for "a small labelled set plus a large unlabeled pool": 20k labelled rows, and
-# the other 100k training texts used without their labels. For your own task, point `train` at
-# the labelled data and `unlabeled` at raw in-domain text.
-#
-# The gate thresholds are starting points, not measured results: set them from your first run.
-#
-#   stagetrain plan configs/classifiers/modernbert-agnews.yaml
-#   stagetrain run  configs/classifiers/modernbert-agnews.yaml
+# the other 100k training texts used without their labels. For your own task, point `train` at the
+# labelled data and `unlabeled` at raw in-domain text. The gate thresholds are starting points,
+# not measured results.
 track: classifiers
 name: modernbert-agnews
 seed: 42
 
 vars:
+  # To compare encoders, add them to the matrix's `init_from` list. In the controlled comparisons
+  # found, DeBERTa-v3 is at least as accurate as ModernBERT on English text up to 512 tokens, at
+  # two to three times the compute; a large model is worth about two points over its base sibling.
   base_model: answerdotai/ModernBERT-base
   dataset: fancyzhx/ag_news
-  max_length: 256
 
 defaults:
   classifiers.finetune:
-    max_length: ${vars.max_length}
-    llrd: 0.9                 # each layer below the top trains 10% slower
-    head_lr_multiplier: 5     # the new head learns faster than the pretrained encoder
-    head_warmup_epochs: 0.5   # LP-FT: head only first, so its random init does not disturb the encoder
-    label_smoothing: 0.05
+    labels: ${data.labels}
+    train_data: ${data.train}
+    eval_data: ${data.eval}
+    # max_length is left at `auto`: the length that fits 99 % of the training rows.
+    early_stopping_patience: 3        # evaluations without improvement; the best checkpoint is kept
     train:
-      learning_rate: 3.0e-5
-      num_train_epochs: 3
+      num_train_epochs: 5             # an upper bound: early stopping decides
       per_device_train_batch_size: 32
       per_device_eval_batch_size: 128
       warmup: 0.06
+      eval_steps: 125                 # about four evaluations per epoch on 16k rows
       group_by_length: true
-      load_best_model_at_end: true
-      metric_for_best_model: eval_macro_f1
-      greater_is_better: true
-  classifiers.calibrate: {max_length: "${vars.max_length}", batch_size: 128}
-  classifiers.eval: {max_length: "${vars.max_length}", batch_size: 128}
+      # precision: bf16               # on a GPU; fp16 has produced NaN losses with ModernBERT
 
 stages:
+  # 1. Four splits. `eval` picks checkpoints and settings, `calibration` fits the temperature,
+  #    `test` is only ever reported.
   - name: data
     kind: classifiers.prepare_data
     params:
       train: {path: "${vars.dataset}", split: "train[:20000]"}
       test: {path: "${vars.dataset}", split: test}
       unlabeled: {path: "${vars.dataset}", split: "train[20000:]"}
-      eval_fraction: 0.1      # stratified, taken out of train; used for model selection and calibration
+      eval_fraction: 0.1
+      calibration_fraction: 0.1
     gate:
       - {metric: n_labels, min: 2}
       - {metric: min_class_count, min: 50}
 
-  # Stage 1: adapt the encoder to the domain's text before it sees a label.
+  # 2. The bar: minutes on a CPU. If a fine-tuned encoder does not clearly beat this, the
+  #    problem is the data or the labels, not the hyperparameters.
+  - name: baseline
+    kind: classifiers.baseline
+    params:
+      labels: ${data.labels}
+      train_data: ${data.train}
+      data: ${data.test}
+
+  # 3. Masked-LM on the task's own text. It helps most when the domain is far from web and news
+  #    text, which AG News is not, so it has to earn its place: stage 4 trains with and without it.
   - name: adapt
     kind: classifiers.mlm_adapt
     params:
       init_from: ${vars.base_model}
       data: ["${data.train}", "${data.unlabeled}"]
-      max_length: ${vars.max_length}
-      mlm_probability: 0.3    # what ModernBERT was pretrained with
+      max_length: 128
+      mlm_probability: 0.15           # lower masking suits classification; 0.3 is the pretraining rate
       train:
         learning_rate: 5.0e-5
         num_train_epochs: 1
         per_device_train_batch_size: 32
         warmup: 0.06
         group_by_length: true
-    gate: {metric: mlm/loss_drop, min: 0.0}   # adaptation must not make the masked-LM worse
 
-  # Stage 2: the teacher, trained on gold labels only.
-  - name: teacher
+  # 4. The settings that matter, swept: the encoder (plain or adapted) and the learning rate, three
+  #    seeds each. 5e-5 and 8e-5 are what ModernBERT's authors selected for the base model.
+  - name: finetune
     kind: classifiers.finetune
-    params:
-      init_from: ${adapt.model}
-      labels: ${data.labels}
-      train_data: ${data.train}
-      eval_data: ${data.eval}
-    gate: {metric: eval/macro_f1, min: 0.85}
+    matrix:
+      init_from: ["${vars.base_model}", "${adapt.model}"]
+      train.learning_rate: [3.0e-5, 5.0e-5, 8.0e-5]
+      seed: [1, 2, 3]
 
-  - name: teacher_calibration
-    kind: classifiers.calibrate
-    params: {model: "${teacher.model}", data: "${data.eval}"}
+  # 5. A setting is judged by its mean over seeds, and its most typical run is handed on: the
+  #    best single run would reward a lucky seed. `select/std` is the size of seed noise.
+  - name: best
+    kind: classifiers.select
+    params: {group: finetune, metric: eval/macro_f1, average_over: [seed]}
+    gate: {metric: select/mean, min: 0.85}
 
-  # Stage 3: the teacher labels the pool; only confident, calibrated predictions are kept.
-  - name: pseudo
-    kind: classifiers.pseudo_label
-    params:
-      model: ${teacher.model}
-      calibration: ${teacher_calibration.calibration}
-      data: ${data.unlabeled}
-      max_length: ${vars.max_length}
-      batch_size: 128
-      min_confidence: 0.95
-      max_per_class: 10000    # keeps the pseudo-labelled set balanced
-    gate:
-      - {metric: pseudo/kept, min: 1000}
-      - {metric: pseudo/classes_covered, min: 4}
-
-  # Stage 4: the student restarts from the adapted encoder on gold + soft pseudo labels.
-  - name: student
-    kind: classifiers.finetune
-    params:
-      init_from: ${adapt.model}
-      labels: ${data.labels}
-      train_data: ${data.train}
-      eval_data: ${data.eval}
-      extra_train_data:
-        - {path: "${pseudo.data}", weight: 0.5}
-    gate:   # self-training must not cost accuracy on gold data
-      - {metric: eval/macro_f1, baseline: teacher.eval/macro_f1, max_drop: 0.005}
-
-  # Stage 5: post-hoc calibration; the weights are final from here on.
+  # 6. The temperature is fitted on rows that picked neither the checkpoint nor the setting.
   - name: calibration
     kind: classifiers.calibrate
-    params: {model: "${student.model}", data: "${data.eval}"}
-    gate: {metric: calibration/ece_after, max: 0.05}
+    params: {model: "${best.model}", data: "${data.calibration}", batch_size: 128}
+    gate:
+      - {metric: calibration/at_bound, max: 0}
+      - {metric: calibration/ece_after, max: 0.05}
 
+  # 7. The reported number, with its interval, and the difference to the baseline row by row.
   - name: test
     kind: classifiers.eval
     params:
-      model: ${student.model}
+      model: ${best.model}
       calibration: ${calibration.calibration}
       data: ${data.test}
-      save_predictions: true
+      batch_size: 128
+      compare_to: ${baseline.predictions}
     gate:
-      - {metric: eval/macro_f1, min: 0.88}
+      - {metric: eval/delta_macro_f1_ci_low, min: 0.0}   # better than the baseline, beyond chance
       - {metric: eval/ece, max: 0.05}
 
   - name: export
     kind: classifiers.export
-    needs: [test]             # only a model that passed the test gate is exported
+    needs: [test]                     # only a model that passed the test gate is exported
     params:
-      model: ${student.model}
+      model: ${best.model}
       calibration: ${calibration.calibration}
-      max_length: ${vars.max_length}
-      onnx: true              # skipped with a note unless `onnx` is installed
+      onnx: true                      # skipped with a note unless `onnx` and `onnxscript` are installed

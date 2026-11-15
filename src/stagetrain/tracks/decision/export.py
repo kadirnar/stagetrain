@@ -43,7 +43,8 @@ class Export(Stage):
             load_tokenizer(p.model, p.trust_remote_code).save_pretrained(str(out))
         calibration = meta.get("calibration")
         if p.calibration:
-            calibration = json.loads(Path(p.calibration).read_text(encoding="utf-8"))["temperature"]
+            fitted = json.loads(Path(p.calibration).read_text(encoding="utf-8"))
+            calibration = {"temperature": fitted["temperature"], "bands": fitted.get("bands") or {}}
         # `init_from` is a path on the training machine; it has no place in a published model.
         kept = ("format", "prompt", "max_length", "calibration", "init_from")
         extra = {k: v for k, v in meta.items() if k not in kept}

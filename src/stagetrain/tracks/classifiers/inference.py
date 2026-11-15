@@ -29,17 +29,18 @@ class Classifier:
             cfg = json.loads(config_path.read_text(encoding="utf-8"))
             self.labels = LabelSpace(cfg["labels"], cfg["problem_type"])
             self.temperature, self.thresholds = cfg.get("temperature", 1.0), cfg.get("thresholds")
-            self.max_length = cfg.get("max_length", 256)
+            self.max_length, self.truncation = cfg.get("max_length"), cfg.get("truncation")
         else:
             self.labels = LabelSpace.load(model_dir)
             calibration = load_calibration(model_dir if (model_dir / "calibration.json").is_file() else None)
-            self.temperature, self.thresholds, self.max_length = calibration["temperature"], calibration["thresholds"], 256
+            self.temperature, self.thresholds = calibration["temperature"], calibration["thresholds"]
+            self.max_length = self.truncation = None  # what the model directory records
         self.predictor = Predictor(model_dir, device, trust_remote_code)
 
     def predict(self, texts: list[str], batch_size: int = 64) -> list[dict[str, Any]]:
         from .metrics import decide, probabilities
 
-        logits = self.predictor.logits([{"text": t} for t in texts], batch_size, self.max_length)
+        logits = self.predictor.logits([{"text": t} for t in texts], batch_size, self.max_length, self.truncation)
         probs = probabilities(logits, self.labels.problem_type, self.temperature)
         pred = decide(probs, self.labels.problem_type, self.thresholds)
         out = []

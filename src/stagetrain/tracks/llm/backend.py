@@ -30,14 +30,24 @@ MERGE_METHODS = ("merged_16bit", "merged_4bit")
 
 
 class LlmTrainArgs(TrainArgs):
-    """`TrainArgs` with the defaults of Unsloth's LoRA recipes."""
+    """`TrainArgs` with defaults for LoRA fine-tuning. Every value is passed explicitly, because
+    Unsloth replaces TRL's own defaults with different ones.
+
+    The learning rate is the setting that matters most and its best value moves with the model,
+    the rank and the batch size: sweep it (a `matrix` over 5e-5 ... 1e-3) instead of trusting 2e-4.
+    """
 
     learning_rate: float = 2e-4
     per_device_train_batch_size: int = 2
-    gradient_accumulation_steps: int = 4
-    lr_scheduler_type: str = "linear"
+    gradient_accumulation_steps: int = 8  # an effective batch of 16
+    lr_scheduler_type: str = "cosine"
     optim: str | None = "adamw_8bit"
     logging_steps: int = 10
+    save_total_limit: int | None = None  # every checkpoint stays, so one can be picked by task metric
+
+
+class SftTrainArgs(LlmTrainArgs):
+    num_train_epochs: float = 3.0  # with a checkpoint per epoch; `llm.select_checkpoint` picks one
 
 
 class CptTrainArgs(LlmTrainArgs):
@@ -48,11 +58,27 @@ class DpoTrainArgs(LlmTrainArgs):
     learning_rate: float = 5e-6
 
 
-class LlmLora(LoraSpec):
-    """`LoraSpec` with Unsloth's defaults, so a config that sets only `r` keeps the fast modules."""
+class GrpoTrainArgs(LlmTrainArgs):
+    """One optimisation step uses `per_device_train_batch_size * gradient_accumulation_steps`
+    completions, which must be a multiple of `num_generations`."""
 
-    r: int = 16
-    alpha: int = 16
+    learning_rate: float = 5e-6
+    per_device_train_batch_size: int = 8
+    gradient_accumulation_steps: int = 1
+    max_steps: int = 300  # reward rarely moves before a few hundred steps
+    lr_scheduler_type: str = "linear"
+    warmup: float = 0.1
+    weight_decay: float = 0.001
+    logging_steps: int = 1
+    save_steps: int | None = 100
+
+
+class LlmLora(LoraSpec):
+    """`LoraSpec` with all seven projections (attention and MLP) and a rank that is not the
+    bottleneck: attention-only adapters and ranks of 8-16 are measurably worse."""
+
+    r: int = 32
+    alpha: int = 32
     target_modules: list[str] | str = Field(default_factory=lambda: list(UNSLOTH_TARGET_MODULES))
 
 
@@ -71,6 +97,9 @@ class LoadSpec:
     load_in: str = "4bit"  # 4bit (QLoRA), 8bit, or 16bit
     full_finetuning: bool = False
     trust_remote_code: bool = False
+    fast_inference: bool = False  # generate with vLLM (for GRPO); LoRA only
+    max_lora_rank: int = 64  # vLLM must be told the largest adapter rank it will serve
+    gpu_memory_utilization: float = 0.5  # vLLM's share of the GPU
 
 
 @dataclass(frozen=True)
@@ -81,6 +110,7 @@ class ResponsesOnly:
     instruction_part: str | None = None
     response_part: str | None = None
     last_response_only: bool = False
+    mask_out_tokens: tuple[str, ...] | None = None  # tokens inside a response that carry no loss
 
 
 @dataclass
@@ -100,7 +130,7 @@ def load_kwargs(spec: LoadSpec) -> dict[str, Any]:
         raise ValueError(f"load_in must be 4bit, 8bit or 16bit, got {spec.load_in!r}")
     if spec.full_finetuning and spec.load_in != "16bit":
         raise ValueError("full_finetuning trains every weight, so it needs load_in: 16bit")
-    return {
+    kwargs = {
         "model_name": spec.model_name,
         "max_seq_length": spec.max_seq_length,
         "dtype": None,  # Unsloth picks bf16 or fp16 for the device
@@ -111,6 +141,13 @@ def load_kwargs(spec: LoadSpec) -> dict[str, Any]:
         "full_finetuning": spec.full_finetuning,
         "trust_remote_code": spec.trust_remote_code,
     }
+    if spec.fast_inference:
+        if spec.full_finetuning or spec.load_in == "8bit":
+            raise ValueError("fast_inference (vLLM) works with LoRA on a 4bit or 16bit base only")
+        kwargs.update(
+            fast_inference=True, max_lora_rank=spec.max_lora_rank, gpu_memory_utilization=spec.gpu_memory_utilization
+        )
+    return kwargs
 
 
 def peft_kwargs(lora: LoraSpec, seed: int, train_embeddings: bool = False) -> dict[str, Any]:
@@ -188,6 +225,64 @@ def dpo_config_kwargs(
     return kwargs
 
 
+GRPO_LOSSES = ("dapo", "grpo", "dr_grpo", "bnpo", "cispo")
+
+
+def grpo_config_kwargs(
+    train: TrainArgs,
+    *,
+    output_dir: str | Path,
+    seed: int,
+    num_generations: int,
+    max_completion_length: int,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    loss_type: str = "dapo",
+    beta: float = 0.0,
+    importance_sampling_level: str = "token",
+    reward_weights: list[float] | None = None,
+    mask_truncated_completions: bool | None = None,
+    template_kwargs: dict[str, Any] | None = None,
+    run_name: str | None = None,
+    bf16: bool | None = None,
+) -> dict[str, Any]:
+    """Keyword arguments of TRL's `GRPOConfig`.
+
+    `loss_type` selects the objective: `dapo` (TRL's and Unsloth's default; token-level
+    normalisation that removes GRPO's bias toward short completions), `dr_grpo`, `bnpo`, the
+    original `grpo`, or `cispo`. `importance_sampling_level: sequence` is GSPO. There is no
+    `max_prompt_length` any more: `llm.grpo` drops over-long prompts before training.
+    """
+    if loss_type not in GRPO_LOSSES:
+        raise ValueError(f"loss_type must be one of {GRPO_LOSSES}, got {loss_type!r}")
+    if importance_sampling_level not in ("token", "sequence"):
+        raise ValueError("importance_sampling_level is token (GRPO) or sequence (GSPO)")
+    if num_generations < 2:
+        raise ValueError("num_generations must be at least 2: the advantage compares completions of one prompt")
+    step = train.per_device_train_batch_size * train.gradient_accumulation_steps
+    if step % num_generations:
+        raise ValueError(
+            f"per_device_train_batch_size * gradient_accumulation_steps = {step} must be a multiple of "
+            f"num_generations = {num_generations}: a step holds whole groups of completions"
+        )
+    if not 0 < temperature < 10:
+        raise ValueError("temperature must be above 0: without sampling every completion of a group is the same")
+    kwargs = _trainer_kwargs(train, output_dir, seed, False, run_name, bf16)
+    kwargs.update(
+        num_generations=num_generations, max_completion_length=max_completion_length, temperature=temperature,
+        top_p=top_p, loss_type=loss_type, beta=beta, importance_sampling_level=importance_sampling_level,
+    )
+    if loss_type == "cispo":
+        kwargs.setdefault("epsilon_high", 5.0)  # older TRL releases fall back to 0.2, which is not CISPO
+    if reward_weights is not None:
+        kwargs["reward_weights"] = list(reward_weights)
+    if mask_truncated_completions is not None:
+        kwargs["mask_truncated_completions"] = mask_truncated_completions
+    if template_kwargs:
+        kwargs["chat_template_kwargs"] = dict(template_kwargs)
+    return kwargs
+
+
 def fit_config_kwargs(kwargs: dict[str, Any], config_cls: type) -> dict[str, Any]:
     """`kwargs` under the names the installed `config_cls` (a `TrainingArguments` dataclass)
     declares. `TrainArgs.to_kwargs` speaks transformers 5.2x; this maps back what older releases
@@ -248,8 +343,9 @@ def has_checkpoint(output_dir: str | Path) -> bool:
 
 
 class UnslothBackend:
-    """Unsloth for loading, LoRA, SFT and export; TRL for DPO. `import unsloth` comes first in
-    every method: it patches transformers and trl, and it must be imported before them."""
+    """Unsloth for loading, LoRA, SFT and export; TRL (patched by Unsloth) for DPO and GRPO.
+    `import unsloth` comes first in every method: it patches transformers and trl, and it must be
+    imported before them."""
 
     name = "unsloth"
 
@@ -299,7 +395,16 @@ class UnslothBackend:
 
     # --------------------------------------------------------------- training
 
-    def _text_trainer(self, model, tokenizer, train_texts, eval_texts, config_kwargs, responses_only):
+    @staticmethod
+    def _callbacks(history_dir: str | Path | None) -> list[Any]:
+        """Write every log line to the stage's `history.jsonl` while it trains."""
+        if history_dir is None:
+            return []
+        from stagetrain.core.history import history_callback
+
+        return [history_callback(history_dir)]
+
+    def _text_trainer(self, model, tokenizer, train_texts, eval_texts, config_kwargs, responses_only, history_dir=None):
         import unsloth  # noqa: F401
         from datasets import Dataset
         from unsloth import UnslothTrainer, UnslothTrainingArguments
@@ -310,15 +415,20 @@ class UnslothBackend:
             train_dataset=Dataset.from_dict({"text": list(train_texts)}),
             eval_dataset=Dataset.from_dict({"text": list(eval_texts)}) if eval_texts else None,
             args=UnslothTrainingArguments(**fit_config_kwargs(config_kwargs, UnslothTrainingArguments)),
+            callbacks=self._callbacks(history_dir),
         )
         if responses_only is not None:
             from unsloth.chat_templates import train_on_responses_only
 
+            extra = {}
+            if responses_only.mask_out_tokens:
+                extra["mask_out_tokens"] = list(responses_only.mask_out_tokens)
             trainer = train_on_responses_only(
                 trainer,
                 instruction_part=responses_only.instruction_part,
                 response_part=responses_only.response_part,
                 last_response_only=responses_only.last_response_only,
+                **extra,
             )
         return trainer
 
@@ -332,10 +442,13 @@ class UnslothBackend:
         *,
         responses_only: ResponsesOnly | None = None,
         resume: bool = True,
+        history_dir: str | Path | None = None,
     ) -> TrainOutput:
         """Causal-LM training on rendered text: continued pretraining (`responses_only=None`) and
         chat fine-tuning (assistant turns only)."""
-        trainer = self._text_trainer(model, tokenizer, train_texts, eval_texts, config_kwargs, responses_only)
+        trainer = self._text_trainer(
+            model, tokenizer, train_texts, eval_texts, config_kwargs, responses_only, history_dir
+        )
         return self._fit(trainer, config_kwargs["output_dir"], bool(eval_texts), resume)
 
     def train_dpo(
@@ -347,6 +460,7 @@ class UnslothBackend:
         config_kwargs: dict[str, Any],
         *,
         resume: bool = True,
+        history_dir: str | Path | None = None,
     ) -> TrainOutput:
         """Direct preference optimisation on prompt / chosen / rejected rows. No reference model is
         passed: with a LoRA adapter TRL recovers the starting policy from the adapter itself (a
@@ -365,8 +479,38 @@ class UnslothBackend:
             train_dataset=Dataset.from_list(list(train_rows)),
             eval_dataset=Dataset.from_list(list(eval_rows)) if eval_rows else None,
             processing_class=tokenizer,
+            callbacks=self._callbacks(history_dir),
         )
         return self._fit(trainer, config_kwargs["output_dir"], bool(eval_rows), resume)
+
+    def train_grpo(
+        self,
+        model,
+        tokenizer,
+        rows: list[dict[str, Any]],
+        reward_funcs: list[Any],
+        config_kwargs: dict[str, Any],
+        *,
+        resume: bool = True,
+        history_dir: str | Path | None = None,
+    ) -> TrainOutput:
+        """Reinforcement learning with verifiable rewards (TRL's `GRPOTrainer`). `rows` hold a
+        `prompt` (chat messages) and an `answer` the reward functions compare completions with.
+        `import unsloth` patches the trainer on import, so nothing else has to be called; with a
+        model loaded for `fast_inference` the trainer generates with vLLM on its own."""
+        import unsloth  # noqa: F401
+        from datasets import Dataset
+        from trl import GRPOConfig, GRPOTrainer
+
+        trainer = GRPOTrainer(
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=list(reward_funcs),
+            args=GRPOConfig(**fit_config_kwargs(config_kwargs, GRPOConfig)),
+            train_dataset=Dataset.from_list(list(rows)),
+            callbacks=self._callbacks(history_dir),
+        )
+        return self._fit(trainer, config_kwargs["output_dir"], False, resume)
 
     @staticmethod
     def _fit(trainer, output_dir: str, has_eval: bool, resume: bool) -> TrainOutput:
@@ -387,27 +531,49 @@ class UnslothBackend:
         trainer = self._text_trainer(model, tokenizer, texts, texts, config_kwargs, responses_only)
         return final_metrics(trainer.evaluate())
 
-    def generate(
-        self, model, tokenizer, conversations: list[list[dict[str, str]]], *, max_new_tokens: int = 256,
-        temperature: float = 0.0, top_p: float = 1.0,
-    ) -> list[str]:
-        """The model's reply to each conversation, one at a time, greedy when `temperature` is 0."""
+    def sample(
+        self, model, tokenizer, conversations: list[list[dict[str, str]]], *, n: int = 1, max_new_tokens: int = 256,
+        temperature: float = 0.0, top_p: float = 1.0, template_kwargs: dict[str, Any] | None = None,
+    ) -> list[list[str]]:
+        """`n` replies to each conversation, one conversation at a time. Greedy when `temperature`
+        is 0, which makes every one of the `n` replies the same: sample to get different ones."""
         import torch
         import unsloth  # noqa: F401
         from unsloth import FastLanguageModel
 
+        if n > 1 and temperature <= 0:
+            raise ValueError("several samples per prompt need temperature > 0")
         FastLanguageModel.for_inference(model)
         sampling = {"do_sample": True, "temperature": temperature, "top_p": top_p} if temperature > 0 else {"do_sample": False}
         device = next(model.parameters()).device
         out = []
         for messages in conversations:
             inputs = tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True
+                messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True,
+                **(template_kwargs or {}),
             ).to(device)
             with torch.no_grad():
-                ids = model.generate(**inputs, max_new_tokens=max_new_tokens, use_cache=True, **sampling)
-            out.append(tokenizer.decode(ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip())
+                ids = model.generate(
+                    **inputs, max_new_tokens=max_new_tokens, use_cache=True, num_return_sequences=n, **sampling
+                )
+            start = inputs["input_ids"].shape[1]
+            out.append([tokenizer.decode(row[start:], skip_special_tokens=True).strip() for row in ids])
         return out
+
+    def generate(
+        self, model, tokenizer, conversations: list[list[dict[str, str]]], *, max_new_tokens: int = 256,
+        temperature: float = 0.0, top_p: float = 1.0, template_kwargs: dict[str, Any] | None = None,
+    ) -> list[str]:
+        """The model's reply to each conversation, greedy when `temperature` is 0."""
+        replies = self.sample(
+            model, tokenizer, conversations, n=1, max_new_tokens=max_new_tokens, temperature=temperature,
+            top_p=top_p, template_kwargs=template_kwargs,
+        )
+        return [r[0] for r in replies]
+
+    def count_tokens(self, tokenizer, texts: list[str]) -> list[int]:
+        """Token counts of already-rendered texts (the template wrote the special tokens)."""
+        return [len(ids) for ids in tokenizer(list(texts), add_special_tokens=False)["input_ids"]]
 
     # ----------------------------------------------------------------- saving
 

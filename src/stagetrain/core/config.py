@@ -19,6 +19,18 @@ References:
     ${run_dir}           the pipeline's run directory, resolved when a stage starts
     ${STAGE.ARTIFACT}    an artifact path of an earlier stage, resolved when a stage starts;
                          it also makes STAGE a dependency
+
+Several runs of one stage:
+
+      - name: sft
+        kind: llm.sft
+        matrix:                                  # one stage per combination: sft-1 ... sft-6
+          train.learning_rate: [1e-4, 3e-4, 1e-3]
+          seed: [1, 2]
+        params: {...}
+      - name: best
+        kind: llm.select                         # the run with the best metric; ${best.model}
+        params: {group: sft, metric: eval/accuracy}
 """
 
 from __future__ import annotations
@@ -91,6 +103,7 @@ class StageSpec(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     gate: list[Gate] = Field(default_factory=list)
     enabled: bool = True
+    variant: dict[str, Any] = Field(default_factory=dict)  # set by a matrix: what this run varies
 
     @field_validator("name")
     @classmethod
@@ -120,6 +133,7 @@ class PipelineConfig(BaseModel):
     vars: dict[str, Any] = Field(default_factory=dict)
     defaults: dict[str, dict[str, Any]] = Field(default_factory=dict)
     stages: list[StageSpec]
+    groups: dict[str, list[str]] = Field(default_factory=dict)  # matrix name -> its runs; filled on load
 
     @property
     def run_dir(self) -> Path:
@@ -279,6 +293,67 @@ def parse_overrides(pairs: Iterable[str]) -> dict[str, Any]:
     return out
 
 
+def set_dotted(params: dict[str, Any], dotted: str, value: Any) -> None:
+    node = params
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        nxt = node.get(part)
+        if not isinstance(nxt, dict):
+            nxt = node[part] = {}
+        node = nxt
+    node[parts[-1]] = value
+
+
+def expand_matrix(stages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    """Every stage with a `matrix` becomes one stage per combination of its values, named
+    `<name>-1`, `<name>-2`, ...; a `needs` entry naming the matrix means all of its runs."""
+    import itertools
+
+    out: list[dict[str, Any]] = []
+    groups: dict[str, list[str]] = {}
+    for stage in stages:
+        matrix = stage.pop("matrix", None)
+        if matrix is None:
+            out.append(stage)
+            continue
+        name = stage.get("name")
+        if not isinstance(matrix, dict) or not matrix or not all(isinstance(v, list) and v for v in matrix.values()):
+            raise ConfigError(f"stage {name!r}: matrix must map parameter paths to non-empty lists")
+        if stage.get("gate"):
+            raise ConfigError(f"stage {name!r}: a matrix stage takes no gate; put it on the stage that selects a run")
+        if stage.get("enabled", True) is False:
+            continue
+        keys = list(matrix)
+        groups[name] = []
+        for i, values in enumerate(itertools.product(*(matrix[k] for k in keys)), start=1):
+            variant = dict(zip(keys, values, strict=True))
+            params = copy.deepcopy(stage.get("params") or {})
+            for key, value in variant.items():
+                set_dotted(params, key, value)
+            run = {k: v for k, v in stage.items() if k not in ("params", "name")}
+            out.append({**run, "name": f"{name}-{i}", "params": params, "variant": variant})
+            groups[name].append(f"{name}-{i}")
+    for stage in out:
+        # A stage that works on a matrix's runs (`group: <matrix name>`) depends on all of them.
+        group = (stage.get("params") or {}).get("group")
+        needs = list(stage.get("needs") or [])
+        selects = str(stage.get("kind", "")).endswith(".select")
+        if isinstance(group, str) and (group in groups or selects) and group not in needs:
+            needs.append(group)
+        expanded: list[str] = []
+        for dep in needs:
+            expanded.extend(groups.get(dep, [dep]))
+        if expanded:
+            stage["needs"] = expanded
+        for ref in stage_refs(stage.get("params") or {}):
+            if ref in groups:
+                raise ConfigError(
+                    f"stage {stage.get('name')!r} refers to ${{{ref}...}}, but {ref!r} is a matrix of "
+                    f"{len(groups[ref])} runs; refer to one run ({groups[ref][0]}) or to a stage that selects one"
+                )
+    return out, groups
+
+
 def build_config(raw: dict, overrides: dict[str, Any] | None = None) -> PipelineConfig:
     if not isinstance(raw, dict):
         raise ConfigError("the configuration must be a mapping")
@@ -304,7 +379,7 @@ def build_config(raw: dict, overrides: dict[str, Any] | None = None) -> Pipeline
         s = dict(s)
         s["params"] = deep_merge(defaults.get(s.get("kind"), {}), s.get("params") or {})
         stages.append(resolve_refs(s, var_lookup))
-    raw["stages"] = stages
+    raw["stages"], raw["groups"] = expand_matrix(stages)
     try:
         return PipelineConfig.model_validate(raw)
     except ConfigError:

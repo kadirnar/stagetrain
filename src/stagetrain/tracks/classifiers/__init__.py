@@ -8,3 +8,7 @@ from . import post, prepare, train  # noqa: F401  (registers the stages)
 from .labels import LabelSpace
 
 __all__ = ["LabelSpace"]
+
+from stagetrain.core.select import register_select  # noqa: E402
+
+register_select("classifiers")

@@ -1,0 +1,176 @@
+# The accuracy pipeline: every stage is here because the evidence in docs/research/llm.md says it
+# pays for itself, in the order it pays.
+#
+#   data ─┬─> eval_base ──> eval_prompted           what the untuned model reaches, also with a better prompt
+#         └─> sft x5 (learning-rate sweep) ──> best_lr ──> pick (checkpoint by task metric) ──> eval_sft
+#                                                    └──> rl_init ──> selfplay ──> grpo ──> eval_grpo ──> export
+#
+#   stagetrain plan   configs/llm/accuracy.yaml
+#   stagetrain run    configs/llm/accuracy.yaml
+#   stagetrain report configs/llm/accuracy.yaml --open
+#
+# The task is grade-school maths (GSM8K): answers end in "#### <number>", so a scorer can check them,
+# which is what reinforcement learning needs. To use your own task, change `data`, the `scorer`
+# and the format reward. The gate thresholds are starting points, not measured results.
+
+track: llm
+name: qwen3-1.7b-gsm8k
+seed: 3407
+
+vars:
+  base_model: unsloth/Qwen3-1.7B     # RL needs a model that already solves part of the task; below ~1.5B it rarely does
+  # How every stage loads the model, writes prompts and judges answers. One definition, so that
+  # an evaluation, a checkpoint choice, generated data and a reward all mean the same by "correct".
+  generation: &generation
+    max_seq_length: 1024
+    load_in: 16bit                    # 16-bit LoRA is the more accurate mode; use 4bit when memory is short
+    scorer: {name: numeric}           # the last number of the answer against the last number of the reference
+    max_new_tokens: 400
+    chat_template_kwargs: {enable_thinking: false}   # the worked solution is in the answer itself
+  training: &training
+    max_seq_length: 1024
+    load_in: 16bit
+    chat_template_kwargs: {enable_thinking: false}
+
+defaults:
+  llm.eval:
+    <<: *generation
+    eval_data: ${data.chat_test}
+    max_samples: 1000                 # +/- 3 points at 70 %; a paired comparison is much tighter
+    measure_loss: false
+  llm.select_checkpoint:
+    <<: *generation
+    eval_data: ${data.chat_eval}      # validation rows: the test rows are never selected on
+    max_samples: 300
+  llm.sft: *training
+
+stages:
+  # 1. Splits by question: validation picks settings and checkpoints, test is only ever reported.
+  #    5 % general chat is mixed into the training rows so the model keeps its general ability.
+  - name: data
+    kind: llm.prepare_data
+    params:
+      chat:
+        - source: {path: openai/gsm8k, name: main, split: train, columns: {prompt: question, completion: answer}}
+          format: prompt_completion
+        - source: {path: mlabonne/FineTome-100k, streaming: true, max_samples: 2000}
+          format: sharegpt
+          replay_ratio: 0.05
+      eval_fraction: 0.05
+      test_fraction: 0.12
+      max_eval: 1000
+
+  # 2. The bar. Fine-tuning is credited only with what it adds over the base model given a good
+  #    prompt, measured with the same scorer, the same decoding and the same questions.
+  - name: eval_base
+    kind: llm.eval
+    params: {init_from: "${vars.base_model}"}
+
+  - name: eval_prompted
+    kind: llm.eval
+    params:
+      init_from: ${vars.base_model}
+      few_shot: 5
+      few_shot_data: ${data.chat_train}
+      system_prompt: Solve the problem step by step. End with "#### " followed by the final number.
+      compare_to: ${eval_base.scores}
+
+  # 3. The learning rate is the setting that matters most, so it is swept: five runs that differ in
+  #    nothing else. All linear layers, rank 64, loss on the answers only, cosine decay, three
+  #    epochs with a checkpoint each.
+  - name: sft
+    kind: llm.sft
+    matrix:
+      train.learning_rate: [5.0e-5, 1.0e-4, 2.0e-4, 5.0e-4, 1.0e-3]
+    params:
+      init_from: ${vars.base_model}
+      train_data: ${data.chat_train}
+      eval_data: ${data.chat_eval}
+      lora: {r: 64, alpha: 32}
+      train: {num_train_epochs: 3, per_device_train_batch_size: 4, gradient_accumulation_steps: 4, warmup: 0.05}
+
+  - name: best_lr
+    kind: llm.select
+    params: {group: sft, metric: eval/loss}    # within one recipe, loss ranks runs well enough
+
+  # 4. Across epochs it does not: validation loss bottoms out early while answers keep improving.
+  #    The checkpoint is chosen by generated answers on the validation rows.
+  - name: pick
+    kind: llm.select_checkpoint
+    params: {init_from: "${best_lr.checkpoints}"}
+
+  - name: eval_sft
+    kind: llm.eval
+    params:
+      init_from: ${pick.model}
+      compare_to: ${eval_prompted.scores}
+    gate:
+      - {metric: eval/delta_ci_low, min: 0.0}     # better than the prompted base model, beyond chance
+      - {metric: eval/no_answer, max: 0.05}       # answers are not being cut off
+
+  # 5. Reinforcement learning starts from a model that still explores: the earliest checkpoint
+  #    within two points of the best. The most-trained one answers too deterministically.
+  - name: rl_init
+    kind: llm.select_checkpoint
+    params: {init_from: "${best_lr.checkpoints}", tolerance: 0.02}
+
+  # 6. The model answers each training question eight times. The share of questions it solves
+  #    sometimes but not always is what RL can work on; near zero, RL has nothing to learn from.
+  - name: selfplay
+    kind: llm.generate_data
+    params:
+      <<: *generation
+      init_from: ${rl_init.model}
+      data: ${data.chat_train}
+      max_samples: 1000
+      samples_per_prompt: 8
+      temperature: 0.8
+    gate: {metric: generate/mixed_fraction, min: 0.1}
+
+  # 7. Preference optimisation on the model's own right and wrong answers. In the one controlled
+  #    comparison it scored below plain SFT at 1.5B and 7 to 9 points above it at 7B, so it is off
+  #    for this model: enable it, and start grpo from it, when the base model is 7B or larger.
+  - name: dpo
+    kind: llm.dpo
+    enabled: false
+    params:
+      <<: *training
+      init_from: ${rl_init.model}
+      train_data: ${selfplay.preference}
+      beta: 0.1
+
+  # 8. GRPO with the DAPO objective. The reward is the scorer's verdict; the small format term
+  #    only keeps the final line parseable.
+  - name: grpo
+    kind: llm.grpo
+    needs: [selfplay]
+    params:
+      <<: *training
+      init_from: ${rl_init.model}
+      train_data: ${data.chat_train}
+      rewards:
+        - {kind: correct, scorer: {name: numeric}, weight: 1.0}
+        - {kind: format, pattern: '####\s*-?[\d,.]+\s*$', weight: 0.1}
+      num_generations: 8
+      max_completion_length: 400
+      loss_type: dapo
+      train: {learning_rate: 5.0e-6, per_device_train_batch_size: 8, max_steps: 500, save_steps: 100}
+    gate: {metric: train/reward_gain, min: 0.0}
+
+  # 9. The held-out reward, decoded greedily, question by question against the model RL started from.
+  - name: eval_grpo
+    kind: llm.eval
+    params:
+      init_from: ${grpo.model}
+      compare_to: ${eval_sft.scores}
+    gate: {metric: eval/score, baseline: eval_sft.eval/score, max_drop: 0.0}
+
+  - name: export
+    kind: llm.export
+    needs: [eval_grpo]
+    params:
+      init_from: ${grpo.model}
+      max_seq_length: 1024
+      load_in: 16bit
+      formats: [lora, merged_16bit, gguf]
+      gguf_quantization: [q4_k_m]

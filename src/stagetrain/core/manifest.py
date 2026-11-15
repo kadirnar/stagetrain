@@ -53,6 +53,7 @@ class Manifest:
     fingerprint: str
     run_id: str
     params: dict[str, Any] = field(default_factory=dict)
+    variant: dict[str, Any] = field(default_factory=dict)  # what a matrix run varies
     upstream: dict[str, str] = field(default_factory=dict)  # needed stage -> the run_id it was read at
     artifacts: dict[str, str] = field(default_factory=dict)
     metrics: dict[str, float] = field(default_factory=dict)

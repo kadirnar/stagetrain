@@ -1,131 +1,146 @@
-# Embedding track, full recipe: a plain encoder becomes a retrieval model in two training stages.
+# The retrieval recipe: every stage is here because the evidence in docs/research/embeddings.md
+# says it pays for itself. It adapts a published embedding model to a domain.
 #
-#   data_weak ─► pretrain ─┬─► mine ─► finetune ─► eval ─► export
-#   data_sup ──────────────┴──────────────┘
+#   data ─┬─> bm25 ─────────────> untuned                 the two numbers to beat, on the test queries
+#         └─> mine (strong embedder + teacher scores)
+#                └─> finetune x6 (temperature x learning rate) ─> best ─> merge ─> test ─> export
 #
-# pretrain   weakly-supervised contrastive pre-training on many (question, answer) pairs,
-#            in-batch negatives only, large batches through gradient caching
-# mine       the pre-trained model searches the supervised corpus for hard negatives
-# finetune   supervised fine-tuning on those negatives, with Matryoshka dimensions
+#   stagetrain plan   configs/embeddings/retrieval.yaml
+#   stagetrain run    configs/embeddings/retrieval.yaml --set vars.pairs=/data/my_pairs.jsonl
+#   stagetrain report configs/embeddings/retrieval.yaml --open
 #
-#   stagetrain plan configs/embeddings/retrieval.yaml
-#   stagetrain run  configs/embeddings/retrieval.yaml
-#   stagetrain run  configs/embeddings/retrieval.yaml --set vars.base_model=<encoder> --set vars.weak_pairs=200000
+# What is not here, on purpose: pre-training a plain encoder on weak pairs (configs/embeddings/pretrain.yaml
+# says when that is worth it), self-mining, rank skipping, and contrastive-only fine-tuning.
+# The gate thresholds are starting points, not measured results.
 
 track: embeddings
-name: modernbert-retrieval
+name: bge-base-retrieval
 seed: 42
 
 vars:
-  base_model: answerdotai/ModernBERT-base
-  max_seq_length: 512
-  weak_pairs: 1000000
-  dims: [768, 512, 256, 128, 64]
+  base_model: BAAI/bge-base-en-v1.5                 # the published embedder that is adapted
+  miner: Snowflake/snowflake-arctic-embed-l-v2.0    # a stronger embedder finds better negatives than the student
+  teacher: BAAI/bge-reranker-v2-m3                  # a cross-encoder whose ranking the student learns
+  pairs: sentence-transformers/natural-questions    # or a local .jsonl / .parquet with query and positive columns
+  encoder: &encoder
+    max_seq_length: 512
+    # bge-v1.5's own query instruction; documents take none. Keep what the checkpoint was trained with.
+    prompts: {query: "Represent this sentence for searching relevant passages: "}
+
+defaults:
+  embeddings.eval:
+    eval_set: ${data.test_set}        # reported numbers come from queries nothing was chosen on
+    encoder: *encoder
 
 stages:
-  - name: data_weak
+  # 1. Three query sets: training, validation (choosing), test (reporting). A query is in one only.
+  - name: data
     kind: embeddings.prepare_data
     params:
       sources:
-        - path: sentence-transformers/gooaq
-          columns: {query: question, positive: answer}
-          shuffle: true
-          max_samples: ${vars.weak_pairs}
-      min_chars: 8
-      max_chars: 4000
-    gate: {metric: data/train_pairs, min: 100000}
-
-  - name: data_sup
-    kind: embeddings.prepare_data
-    params:
-      sources:
-        - path: sentence-transformers/natural-questions
+        - path: ${vars.pairs}
           columns: {query: query, positive: answer}
-      eval_fraction: 0.02          # split by query hash: no eval query is ever trained on
+          max_samples: 60000
+      eval_fraction: 0.03
+      test_fraction: 0.05               # ~1,000+ queries: enough to see 1-2 points of nDCG@10
       max_eval_queries: 2000
-      max_eval_distractors: 100000 # training documents that make the eval corpus harder
+      max_eval_distractors: 100000      # training documents that make each held-out corpus harder
       min_chars: 8
       max_chars: 4000
 
-  - name: pretrain
-    kind: embeddings.pretrain
-    params:
-      init_from: ${vars.base_model}
-      train_data: ${data_weak.train}
-      eval_set: ${data_sup.eval_set}
-      encoder:
-        pooling: mean
-        max_seq_length: ${vars.max_seq_length}
-      loss:
-        name: cached_mnrl          # contrastive batch of 512, encoded 64 at a time
-        mini_batch_size: 64
-      batch_sampler: no_duplicates
-      train:
-        learning_rate: 1.0e-4
-        num_train_epochs: 1
-        per_device_train_batch_size: 512
-        warmup: 0.05
-        logging_steps: 50
-        eval_steps: 500
-        save_total_limit: 2
-    gate: {metric: eval/ndcg@10, min: 0.2}   # a floor: stop here if pre-training learned nothing
+  # 2. The bar: keyword search, and the published model before any training.
+  - name: bm25
+    kind: embeddings.bm25
+    params: {eval_set: "${data.test_set}"}
 
+  - name: untuned
+    kind: embeddings.eval
+    params:
+      model: ${vars.base_model}
+      compare_to: ${bm25.scores}
+
+  # 3. Hard negatives from a stronger embedder, rescored by the teacher. The only false-negative
+  #    filter is the positive-aware one: a candidate must score under 95 % of its positive. No ranks
+  #    are skipped. 15 candidates per query, with scores, for listwise distillation.
   - name: mine
     kind: embeddings.mine_negatives
     params:
-      model: ${pretrain.model}
-      train_data: ${data_sup.train}
-      corpus: ${data_sup.corpus}
-      num_negatives: 5
-      range_min: 10                # skip the nearest ranks, where unlabeled positives sit
-      range_max: 100
-      relative_margin: 0.05        # drop candidates scoring within 5% of the positive (likely false negatives)
-      batch_size: 256
+      model: ${vars.miner}
+      train_data: ${data.train}
+      corpus: ${data.corpus}
+      cross_encoder: ${vars.teacher}
+      teacher_scores: probability       # this reranker's scores are sigmoid outputs in (0, 1)
+      relative_margin: 0.05
+      range_min: 0
+      range_max: 60
+      num_negatives: 15
+      output_scores: true
+      batch_size: 128
+      encoder: {max_seq_length: 512}    # the miner keeps the prompts saved with its checkpoint
     gate: {metric: mine/kept_fraction, min: 0.5}
 
+  # 4. Listwise distillation of the teacher's ranking plus a small contrastive term. Contrastive
+  #    training alone often lowers an already supervised embedder. The temperature and the learning
+  #    rate have no published sweep to lean on, so both are swept; add `seed: [1, 2, 3]` to the
+  #    matrix (and `average_over: [seed]` to the select) when differences are within a point.
   - name: finetune
     kind: embeddings.finetune
+    matrix:
+      loss.scale: [20, 50, 100]                   # temperature 0.05, 0.02, 0.01
+      train.learning_rate: [1.0e-5, 3.0e-5]
     params:
-      init_from: ${pretrain.model}
+      init_from: ${vars.base_model}
       train_data: ${mine.train}
-      eval_pairs: ${data_sup.eval_pairs}
-      eval_set: ${data_sup.eval_set}
-      eval_dims: [256, 64]
+      eval_set: ${data.eval_set}
+      encoder: *encoder
       loss:
         name: mnrl
-        matryoshka_dims: ${vars.dims}
-      batch_sampler: no_duplicates
+        distill_weight: 1.0
+        contrastive_weight: 0.1
+        distill_loss: kl_div
+        student_temperature: 0.05
+        teacher_temperature: 0.3
       train:
-        learning_rate: 2.0e-5
-        num_train_epochs: 2
-        per_device_train_batch_size: 64
-        warmup: 0.1
+        num_train_epochs: 1
+        per_device_train_batch_size: 32
+        warmup: 0.05
         logging_steps: 20
         eval_steps: 250
         save_total_limit: 2
         load_best_model_at_end: true
         metric_for_best_model: eval_ir_cosine_ndcg@10
         greater_is_better: true
-    gate:                          # fine-tuning must not end below the model it started from
-      metric: eval/ndcg@10
-      baseline: pretrain.eval/ndcg@10
-      max_drop: 0.0
 
-  - name: eval
+  - name: best
+    kind: embeddings.select
+    params: {group: finetune, metric: eval/ndcg@10}
+
+  # 5. A quarter of the starting model's weights back in: domain tuning costs general retrieval
+  #    ability, and this returns most of it for about a point in-domain. The gate bounds that point.
+  - name: merge
+    kind: embeddings.merge
+    params:
+      models: ["${best.model}"]
+      base: ${vars.base_model}
+      base_weight: 0.25
+      eval_set: ${data.eval_set}
+      encoder: *encoder
+    gate: {metric: eval/ndcg@10, baseline: best.eval/ndcg@10, max_drop: 0.02}
+
+  # 6. The reported number: the merged model on the test queries, query by query against the
+  #    untuned model. `nanobeir: true` adds a general-ability check (it downloads the NanoBEIR sets).
+  - name: test
     kind: embeddings.eval
     params:
-      model: ${finetune.model}
-      eval_set: ${data_sup.eval_set}
-      dims: [256, 64]
-      recall_at: [1, 10, 100]
+      model: ${merge.model}
+      compare_to: ${untuned.scores}
     gate:
-      - {metric: eval/ndcg@10, baseline: pretrain.eval/ndcg@10, max_drop: 0.0}
-      - {metric: eval/dim256/ndcg@10, baseline: finetune.eval/ndcg@10, max_drop: 0.05}  # cost of truncating to 256
+      - {metric: eval/delta_ci_low, min: 0.0}                                    # better than untuned, beyond chance
+      - {metric: eval/ndcg@10, baseline: bm25.eval/ndcg@10, max_drop: 0.0}       # and not below keyword search
 
   - name: export
     kind: embeddings.export
-    needs: [eval]                  # only a model that passed evaluation is exported
+    needs: [test]
     params:
-      model: ${finetune.model}
+      model: ${merge.model}
       normalize: true
-      onnx: false

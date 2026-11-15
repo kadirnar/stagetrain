@@ -35,22 +35,101 @@ def pick_device(device: str | None = None) -> torch.device:
 # --------------------------------------------------------------------------- #
 
 
-def encode(tokenizer, rows: Sequence[dict[str, Any]], max_length: int) -> list[dict[str, list[int]]]:
-    """Token ids for every row's `text` (and `text_pair`, for the rows that have one), truncated,
-    not padded."""
-    out: list[dict[str, list[int]]] = [{} for _ in rows]
+PREPROCESSING_FILE = "preprocessing.json"
+HEAD_SHARE = 0.25  # of a head+tail window: the first quarter and the last three quarters
+
+
+def _tokenize(tokenizer, rows: Sequence[dict[str, Any]], idx: list[int], with_pair: bool, **kwargs):
+    texts = [str(rows[i]["text"]) for i in idx]
+    pairs = [str(rows[i]["text_pair"]) for i in idx] if with_pair else None
+    return tokenizer(texts, pairs, **kwargs)
+
+
+def _groups(rows: Sequence[dict[str, Any]]) -> tuple[tuple[list[int], bool], tuple[list[int], bool]]:
     paired = [i for i, r in enumerate(rows) if r.get("text_pair")]
     single = [i for i, r in enumerate(rows) if not r.get("text_pair")]
-    for idx, with_pair in ((single, False), (paired, True)):
+    return (single, False), (paired, True)
+
+
+def token_lengths(tokenizer, rows: Sequence[dict[str, Any]]) -> list[int]:
+    """How many tokens every row takes when nothing is cut, special tokens included."""
+    out = [0] * len(rows)
+    for idx, with_pair in _groups(rows):
+        if idx:
+            enc = _tokenize(tokenizer, rows, idx, with_pair, truncation=False, verbose=False)
+            for j, i in enumerate(idx):
+                out[i] = len(enc["input_ids"][j])
+    return out
+
+
+def model_limit(tokenizer, config=None) -> int:
+    """The longest input the model takes: the tokenizer's limit, or the config's positions."""
+    limits = [n for n in (getattr(tokenizer, "model_max_length", None),
+                          getattr(config, "max_position_embeddings", None)) if n and n < 1_000_000]
+    return int(min(limits)) if limits else 512
+
+
+def auto_max_length(lengths: Sequence[int], percentile: float = 99.0, limit: int = 512, multiple: int = 8) -> int:
+    """The length that fits `percentile` percent of the rows, rounded up to a multiple of
+    `multiple` and capped at `limit`."""
+    if not lengths:
+        return min(limit, multiple)
+    ordered = sorted(lengths)
+    rank = min(len(ordered) - 1, max(0, -(-len(ordered) * percentile // 100) - 1))
+    need = int(ordered[int(rank)])
+    return int(min(limit, max(multiple, -(-need // multiple) * multiple)))
+
+
+def _head_tail(ids: list[int], max_length: int) -> list[int]:
+    """Positions kept of an over-long row: the start (with the leading special token) and the end
+    (with the closing one). Where the signal sits is not known in advance; the two ends of a
+    document carry more of it than its middle."""
+    head = max(1, int(max_length * HEAD_SHARE))
+    return [*range(head), *range(len(ids) - (max_length - head), len(ids))]
+
+
+def encode(
+    tokenizer, rows: Sequence[dict[str, Any]], max_length: int, truncation: str = "head"
+) -> list[dict[str, list[int]]]:
+    """Token ids for every row's `text` (and `text_pair`, for the rows that have one), cut to
+    `max_length`, not padded. `truncation: head` keeps the start of an over-long text;
+    `head_tail` keeps its start and its end. Sentence pairs are always cut from the longer side."""
+    out: list[dict[str, list[int]]] = [{} for _ in rows]
+    for idx, with_pair in _groups(rows):
         if not idx:
             continue
-        texts = [str(rows[i]["text"]) for i in idx]
-        pairs = [str(rows[i]["text_pair"]) for i in idx] if with_pair else None
-        enc = tokenizer(texts, pairs, truncation=True, max_length=max_length)
+        both_ends = truncation == "head_tail" and not with_pair
+        if both_ends:
+            enc = _tokenize(tokenizer, rows, idx, with_pair, truncation=False, verbose=False)
+        else:
+            enc = _tokenize(tokenizer, rows, idx, with_pair, truncation=True, max_length=max_length)
         keys = [k for k in tokenizer.model_input_names if k in enc]
         for j, i in enumerate(idx):
-            out[i] = {k: enc[k][j] for k in keys}
+            row = {k: enc[k][j] for k in keys}
+            if both_ends and len(row["input_ids"]) > max_length:
+                keep = _head_tail(row["input_ids"], max_length)
+                row = {k: [v[t] for t in keep] for k, v in row.items()}
+            out[i] = row
     return out
+
+
+def read_preprocessing(model_dir: str | Path) -> dict[str, Any]:
+    """How a model's inputs were cut when it was trained, so later stages read it the same way."""
+    import json
+
+    path = Path(model_dir) / PREPROCESSING_FILE
+    if not path.is_file():
+        return {"max_length": 256, "truncation": "head"}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {"max_length": int(data.get("max_length", 256)), "truncation": data.get("truncation", "head")}
+
+
+def write_preprocessing(model_dir: str | Path, max_length: int, truncation: str) -> Path:
+    import json
+
+    path = Path(model_dir) / PREPROCESSING_FILE
+    path.write_text(json.dumps({"max_length": max_length, "truncation": truncation}, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 class RowDataset(torch.utils.data.Dataset):
@@ -68,11 +147,11 @@ class RowDataset(torch.utils.data.Dataset):
 
 def build_dataset(
     tokenizer, rows: Sequence[dict[str, Any]], labels: LabelSpace, max_length: int, smoothing: float = 0.0,
-    soft_label_weight: float = 1.0,
+    soft_label_weight: float = 1.0, truncation: str = "head",
 ) -> RowDataset:
     """Rows as model inputs plus `labels` (the target distribution, see `row_target`) and
     `sample_weight` (a row's own `weight`, times `soft_label_weight` when it carries `probs`)."""
-    features = encode(tokenizer, rows, max_length)
+    features = encode(tokenizer, rows, max_length, truncation)
     for feat, row in zip(features, rows, strict=True):
         feat["labels"] = row_target(row, len(labels), labels.problem_type, smoothing)
         weight = float(row.get("weight", 1.0))
@@ -111,6 +190,7 @@ def classification_loss(
     problem_type: str = "single_label",
     class_weights: torch.Tensor | None = None,
     focal_gamma: float = 0.0,
+    logit_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cross-entropy against target distributions `(B, C)`, so gold, smoothed and soft
     (pseudo-labelled) rows share one loss.
@@ -119,8 +199,16 @@ def classification_loss(
     `sum_c w_c t_c` like `F.cross_entropy(weight=w)`; with one-hot targets and `gamma=0` it equals
     it. Multi-label: BCE per label with `pos_weight=w` and the focal factor `(1 - p_t)^gamma`,
     averaged over labels. `sample_weight` scales each row.
+
+    `logit_bias` (single-label, `tau * log prior`) is added to the logits inside the loss only:
+    the logit-adjusted loss. A frequent class then needs a larger raw logit to win during
+    training, so the raw logits used at prediction time are balanced across classes.
     """
     logits, targets = logits.float(), targets.float()
+    if logit_bias is not None:
+        if problem_type == MULTI:
+            raise ValueError("the logit-adjusted loss is for single-label tasks")
+        logits = logits + logit_bias.to(logits.device)
     if sample_weight is None:
         sample_weight = torch.ones(len(logits), device=logits.device)
     sample_weight = sample_weight.float()
@@ -224,8 +312,29 @@ def freeze_backbone(model, frozen: bool = True) -> int:
 # --------------------------------------------------------------------------- #
 
 
-def load_classifier(init_from: str, labels: LabelSpace, trust_remote_code: bool = False, dropout: float | None = None):
-    """An encoder with a fresh or matching classification head for `labels`, and its tokenizer."""
+# The config field that holds the classification head's dropout, by architecture family.
+DROPOUT_FIELDS = ("classifier_dropout", "cls_dropout")
+
+
+def log_prior(counts: Sequence[int], tau: float = 1.0) -> list[float]:
+    """`tau * log(class frequency)`, the bias of the logit-adjusted loss. A class that never
+    occurs gets the smallest observed frequency, so the bias stays finite."""
+    import math
+
+    total = sum(counts)
+    if total <= 0:
+        raise ValueError("the label map carries no class counts; they are written by classifiers.prepare_data")
+    floor = min(c for c in counts if c > 0)
+    return [tau * math.log(max(c, floor) / total) for c in counts]
+
+
+def load_classifier(
+    init_from: str, labels: LabelSpace, trust_remote_code: bool = False, dropout: float | None = None,
+    pooling: str | None = None,
+):
+    """`(model, tokenizer, notes)`: an encoder with a fresh or matching classification head for
+    `labels`. `dropout` and `pooling` are set on the config field the architecture has for them;
+    an architecture without one keeps its own behaviour, which `notes` records."""
     from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(init_from, trust_remote_code=trust_remote_code)
@@ -237,14 +346,28 @@ def load_classifier(init_from: str, labels: LabelSpace, trust_remote_code: bool 
         problem_type="multi_label_classification" if labels.multi else "single_label_classification",
         trust_remote_code=trust_remote_code,
     )
+    notes: dict[str, Any] = {}
     if dropout is not None:
-        if not hasattr(config, "classifier_dropout"):
-            raise ValueError(f"{init_from}: this architecture's config has no classifier_dropout to set")
-        config.classifier_dropout = dropout
+        # DeBERTa reads `cls_dropout` with getattr, so the field counts although its config does not declare it.
+        declared = [f for f in DROPOUT_FIELDS if hasattr(config, f)]
+        field = declared[0] if declared else ("cls_dropout" if config.model_type.startswith("deberta") else None)
+        if field is None:
+            notes["classifier_dropout"] = f"not set: a {config.model_type} head has no dropout"
+        else:
+            setattr(config, field, dropout)
+            notes["classifier_dropout"] = f"{field}={dropout}"
+    if pooling is not None:
+        if hasattr(config, "classifier_pooling"):
+            config.classifier_pooling = pooling
+            notes["pooling"] = pooling
+        else:
+            notes["pooling"] = f"not set: {config.model_type} has no classifier_pooling option"
+    elif hasattr(config, "classifier_pooling"):
+        notes["pooling"] = config.classifier_pooling
     model = AutoModelForSequenceClassification.from_pretrained(
         init_from, config=config, ignore_mismatched_sizes=True, trust_remote_code=trust_remote_code
     )
-    return model, tokenizer
+    return model, tokenizer, notes
 
 
 class Predictor:
@@ -260,13 +383,21 @@ class Predictor:
         self.device = pick_device(device)
         self.model.to(self.device).eval()
         self.collate = Collator(self.tokenizer)
+        self.preprocessing = read_preprocessing(model_dir)
 
     @torch.inference_mode()
-    def logits(self, rows: Sequence[dict[str, Any]], batch_size: int = 64, max_length: int = 256):
-        """`(N, C)` float32 numpy logits in the order of `rows`. Rows are batched by length."""
+    def logits(
+        self, rows: Sequence[dict[str, Any]], batch_size: int = 64, max_length: int | None = None,
+        truncation: str | None = None,
+    ):
+        """`(N, C)` float32 numpy logits in the order of `rows`. Rows are batched by length, and
+        cut the way the model was trained unless `max_length` / `truncation` say otherwise."""
         import numpy as np
 
-        features = encode(self.tokenizer, rows, max_length)
+        features = encode(
+            self.tokenizer, rows, max_length or self.preprocessing["max_length"],
+            truncation or self.preprocessing["truncation"],
+        )
         order = sorted(range(len(features)), key=lambda i: len(features[i]["input_ids"]))
         out = np.zeros((len(features), self.model.config.num_labels), dtype=np.float32)
         for start in range(0, len(order), batch_size):
@@ -278,11 +409,6 @@ class Predictor:
 
 def gold_targets(rows: Sequence[dict[str, Any]], labels: LabelSpace):
     """Evaluation targets: class indices `(N,)`, or a 0/1 matrix `(N, C)` for multi-label."""
-    import numpy as np
+    from .metrics import targets_array
 
-    if labels.multi:
-        y = np.zeros((len(rows), len(labels)), dtype=np.int64)
-        for i, row in enumerate(rows):
-            y[i, row["labels"]] = 1
-        return y
-    return np.asarray([row["label"] for row in rows], dtype=np.int64)
+    return targets_array(rows, len(labels), labels.problem_type)

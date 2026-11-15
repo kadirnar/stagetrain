@@ -23,6 +23,8 @@ from stagetrain.core import (
 
 from .schema import CHOICE, Record, content_key, unit_interval
 
+SPLITS = ("train", "eval", "calibration", "heldout_eval", "heldout_calibration")
+
 
 class SourceSpec(BaseModel):
     """One dataset and how its rows become questions.
@@ -49,10 +51,20 @@ class SourceSpec(BaseModel):
     threshold: float | None = None  # binary, numeric labels: yes when label >= threshold
     levels: list[str] | None = None  # rating: a description per level, lowest first
     offset: int = 0  # rating: level = label - offset
+    threshold_soft: bool = False  # binary, labels in [0, 1]: keep the fraction as a soft target [p, 1 - p]
     eval_fraction: float = 0.02
     calibration_fraction: float = 0.02
     max_train: int | None = None
     max_eval: int | None = 2000
+    # `heldout`: no row of this source is trained on. Half of its rows go to `heldout_eval`, half
+    # to `heldout_calibration`. A model is over-confident on tasks it has not seen, so that is
+    # where its temperature has to be fitted and where its accuracy means something.
+    role: Literal["train", "heldout"] = "train"
+    # Long states with the evidence buried: this share of the training rows gets its state placed
+    # among `buried_records` other states of the same source, and the question names which record
+    # it is about. Short datasets otherwise never teach the model to find what matters in a long input.
+    buried_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+    buried_records: int = Field(default=12, ge=2)
 
     @model_validator(mode="after")
     def _check(self) -> SourceSpec:
@@ -91,6 +103,8 @@ def _instructions(spec: SourceSpec, key: str) -> str:
 def _option_name(spec: SourceSpec, raw: Any) -> str:
     names = spec.label_names
     if isinstance(names, list):
+        if not 0 <= int(raw) < len(names):
+            raise ValueError(f"label {raw!r} is outside the {len(names)} label names")  # e.g. -1 for "no label"
         return names[int(raw)]
     if isinstance(names, dict):
         return names[str(raw)]
@@ -150,7 +164,15 @@ def to_record(row: Mapping[str, Any], spec: SourceSpec, options: list[str] | Non
         elif spec.task == "binary":
             criteria = {k: spec.descriptions[k] for k in ("true", "false") if k in spec.descriptions}
             question = {"type": "noul", "instructions": instructions, "criteria": criteria or None}
-            if spec.threshold is not None:
+            if spec.threshold_soft:
+                p_yes = min(max(float(row["label"]), 0.0), 1.0)
+                record = Record.parse({
+                    "id": key, "source": spec.name, "state": state, "question": question, "target": [p_yes, 1.0 - p_yes],
+                }) if 0.0 < p_yes < 1.0 else None
+                if record is not None:
+                    return record.to_json()
+                answer = p_yes >= 0.5
+            elif spec.threshold is not None:
                 answer = float(row["label"]) >= spec.threshold
             else:
                 answer = str(row["label"]).strip().lower() in {p.lower() for p in spec.positive}
@@ -162,14 +184,43 @@ def to_record(row: Mapping[str, Any], spec: SourceSpec, options: list[str] | Non
 
 
 def split_of(key: str, spec: SourceSpec) -> str:
-    """`train`, `eval` or `calibration`, decided by the content hash: a duplicate row always lands
-    in the same split, so nothing leaks between them."""
+    """`train`, `eval` or `calibration` (for a held-out source: `heldout_eval` or
+    `heldout_calibration`), decided by the content hash: a duplicate row always lands in the same
+    split, so nothing leaks between them."""
     u = unit_interval(key)
+    if spec.role == "heldout":
+        return "heldout_eval" if u < 0.5 else "heldout_calibration"
     if spec.eval_data is None and u < spec.eval_fraction:
         return "eval"
     if u < spec.eval_fraction * (spec.eval_data is None) + spec.calibration_fraction:
         return "calibration"
     return "train"
+
+
+def bury(records: list[dict[str, Any]], fraction: float, n_records: int, seed: int) -> int:
+    """Rewrite a share of `records` in place so that each one's state sits among other states of
+    the same list, as `{"records": [{"id", "content"}, ...]}`, and its question names the record
+    it is about. Returns how many were rewritten. Which rows, which neighbours and which position
+    depend only on the row's id and the seed."""
+    if fraction <= 0 or len(records) <= n_records:
+        return 0
+    states = [r["state"] for r in records]
+    buried = 0
+    for i, record in enumerate(records):
+        rng = random.Random(f"{seed}:bury:{record['id']}")
+        if rng.random() >= fraction:
+            continue
+        others = rng.sample([j for j in range(len(records)) if j != i], n_records - 1)
+        position = rng.randrange(n_records)
+        contents = [states[j] for j in others]
+        contents.insert(position, states[i])
+        record["state"] = {"records": [{"id": f"r{k + 1}", "content": c} for k, c in enumerate(contents)]}
+        question = dict(record["question"])
+        question["instructions"] = f"About the record with id r{position + 1}: {question['instructions']}"
+        record["question"] = question
+        record["id"] = content_key(record["id"], "buried")
+        buried += 1
+    return buried
 
 
 # --------------------------------------------------------------------------- #
@@ -225,11 +276,16 @@ def build_source(spec: SourceSpec, seed: int) -> tuple[dict[str, list[dict[str, 
     """`({split: records}, counters)` for one source."""
     from stagetrain.core import load_source
 
-    rows = list(load_source(spec.data))
+    dataset = load_source(spec.data)
+    # A dataset that names its classes (a ClassLabel column) supplies the option names itself.
+    declared = getattr(getattr(dataset, "features", {}).get("label"), "names", None)
+    if spec.task == "classification" and spec.label_names is None and declared:
+        spec = spec.model_copy(update={"label_names": [str(n) for n in declared]})
+    rows = list(dataset)
     options = _options(spec, rows) if spec.task == "classification" else None
-    splits: dict[str, list[dict[str, Any]]] = {"train": [], "eval": [], "calibration": []}
+    splits: dict[str, list[dict[str, Any]]] = {name: [] for name in SPLITS}
     seen: set[str] = set()
-    counters = {"duplicates": 0, "leaks_removed": 0, "skipped": 0}
+    counters = {"duplicates": 0, "leaks_removed": 0, "skipped": 0, "buried": 0}
 
     held_out: set[str] = set()
     if spec.eval_data is not None:
@@ -261,9 +317,11 @@ def build_source(spec: SourceSpec, seed: int) -> tuple[dict[str, list[dict[str, 
             f"the first error was {type(first_error).__name__}: {first_error}"
         ) from first_error
     rng = random.Random(f"{seed}:{spec.name}")
-    for name, limit in (("train", spec.max_train), ("eval", spec.max_eval), ("calibration", spec.max_eval)):
+    limits = {"train": spec.max_train, **{name: spec.max_eval for name in SPLITS if name != "train"}}
+    for name, limit in limits.items():
         if limit is not None and len(splits[name]) > limit:
             splits[name] = rng.sample(splits[name], limit)
+    counters["buried"] = bury(splits["train"], spec.buried_fraction, spec.buried_records, seed)
     return splits, counters
 
 
@@ -275,7 +333,7 @@ class BuildData(Stage):
 
     def run(self, ctx: StageContext) -> StageResult:
         seed = self.seed(ctx)
-        merged: dict[str, list[dict[str, Any]]] = {"train": [], "eval": [], "calibration": []}
+        merged: dict[str, list[dict[str, Any]]] = {name: [] for name in SPLITS}
         audit: dict[str, Any] = {}
         totals: Counter = Counter()
         names = [s.name for s in self.params.sources]
@@ -284,7 +342,8 @@ class BuildData(Stage):
         for spec in self.params.sources:
             splits, counters = build_source(spec, seed)
             totals.update(counters)
-            audit[spec.name] = {**audit_source(splits["train"], self.params.majority_warning), **counters}
+            audited = splits["train"] if spec.role == "train" else splits["heldout_eval"] + splits["heldout_calibration"]
+            audit[spec.name] = {**audit_source(audited, self.params.majority_warning), **counters, "role": spec.role}
             for warning in audit[spec.name]["warnings"]:
                 ctx.log.warning("source %s: %s", spec.name, warning)
             for name, records in splits.items():
@@ -302,6 +361,9 @@ class BuildData(Stage):
         metrics = {
             "data/train": len(merged["train"]), "data/eval": len(merged["eval"]),
             "data/calibration": len(merged["calibration"]), "data/sources": len(names),
+            "data/heldout_sources": sum(s.role == "heldout" for s in self.params.sources),
+            "data/heldout_eval": len(merged["heldout_eval"]),
+            "data/heldout_calibration": len(merged["heldout_calibration"]), "data/buried": totals["buried"],
             "data/duplicates": totals["duplicates"], "data/leaks_removed": totals["leaks_removed"],
             "data/skipped": totals["skipped"], "data/max_majority_baseline": max(baselines, default=0.0),
             "data/warnings": sum(len(a["warnings"]) for a in audit.values()),

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from llm_fakes import FakeBackend
 
 from stagetrain.core import (
     GateFailed,
@@ -15,117 +16,12 @@ from stagetrain.core import (
     write_jsonl,
 )
 from stagetrain.tracks.llm import set_backend
-from stagetrain.tracks.llm.backend import TrainOutput, is_adapter_dir
+from stagetrain.tracks.llm.backend import is_adapter_dir
 from stagetrain.tracks.llm.evaluate import score
 
 pytest.importorskip("datasets")  # llm.prepare_data reads its sources through `datasets`
 
 CONFIGS = sorted((Path(__file__).parent.parent / "configs" / "llm").glob("*.yaml"))
-
-
-class FakeTokenizer:
-    eos_token = "</s>"
-    chat_template = "fake"
-
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-        assert tokenize is False and add_generation_prompt is False
-        return "".join(f"<|{m['role']}|>{m['content']}</s>" for m in messages)
-
-
-class FakeModel:
-    def __init__(self, name, adapter, full):
-        self.name, self.adapter, self.full, self.lora = name, adapter, full, None
-
-
-class FakeBackend:
-    """Records what the stages ask for and writes the files a real backend would leave behind."""
-
-    def __init__(self, eval_loss=None):
-        self.calls = []
-        self.eval_loss = eval_loss or {}  # substring of the model's name -> loss
-
-    def _loss(self, model):
-        for key, value in self.eval_loss.items():
-            if key in model.name:
-                return value
-        return 1.0
-
-    def load(self, spec):
-        self.calls.append(("load", spec.model_name, spec.load_in, spec.full_finetuning))
-        return FakeModel(spec.model_name, is_adapter_dir(spec.model_name), spec.full_finetuning), FakeTokenizer()
-
-    def has_adapter(self, model):
-        return model.adapter
-
-    def attach_lora(self, model, kwargs):
-        self.calls.append(("attach_lora", kwargs))
-        model.adapter, model.lora = True, kwargs
-        return model
-
-    def set_chat_template(self, tokenizer, name):
-        self.calls.append(("chat_template", name))
-        tokenizer.chat_template = name
-        return tokenizer
-
-    def bf16_supported(self):
-        return True
-
-    def release(self):
-        self.calls.append(("release",))
-
-    def train_text(self, model, tokenizer, train_texts, eval_texts, config, *, responses_only=None, resume=True):
-        self.calls.append(("train_text", {
-            "model": model.name, "train": list(train_texts), "eval": list(eval_texts), "config": config,
-            "responses_only": responses_only, "resume": resume,
-        }))
-        metrics = {"train/loss": 0.9}
-        if eval_texts:
-            metrics["eval/loss"] = self._loss(model)
-        return TrainOutput(metrics, [{"step": 1, "loss": 0.9}])
-
-    def train_dpo(self, model, tokenizer, train_rows, eval_rows, config, *, resume=True):
-        self.calls.append(("train_dpo", {"model": model.name, "train": list(train_rows), "config": config}))
-        return TrainOutput({"train/loss": 0.6, "eval/loss": 0.5} if eval_rows else {"train/loss": 0.6}, [])
-
-    def evaluate_loss(self, model, tokenizer, texts, config, *, responses_only=None):
-        self.calls.append(("evaluate_loss", {"model": model.name, "texts": list(texts), "responses_only": responses_only}))
-        return {"eval/loss": self._loss(model), "eval/runtime": 1.0}
-
-    def generate(self, model, tokenizer, conversations, *, max_new_tokens=256, temperature=0.0, top_p=1.0):
-        self.calls.append(("generate", len(conversations)))
-        out = []
-        for i, messages in enumerate(conversations):
-            assert messages[-1]["role"] == "user"  # the reference answer is never shown to the model
-            asked = messages[-1]["content"]
-            truth = asked.replace("Question", "Answer").rstrip("?") if asked.startswith("Question") else asked.replace("Do", "Done")
-            # the first answer is exactly right, the second only contains it, the rest are wrong
-            out.append([f"<think>hmm</think> {truth}", f"Sure: {truth.lower()}!", "no idea"][min(i, 2)])
-        return out
-
-    def save(self, model, tokenizer, out_dir):
-        self.calls.append(("save", str(out_dir)))
-        name = "adapter_config.json" if model.adapter else "config.json"
-        saved = (model.lora or {}).get("modules_to_save")
-        Path(out_dir, name).write_text(json.dumps({"base_model_name_or_path": model.name, "modules_to_save": saved}))
-
-    def save_merged(self, model, tokenizer, out_dir, method="merged_16bit"):
-        self.calls.append(("save_merged", str(out_dir), method))
-        Path(out_dir, "config.json").write_text(json.dumps({"merged_from": model.name, "method": method}))
-
-    def save_gguf(self, model, tokenizer, out_dir, quantization):
-        self.calls.append(("save_gguf", str(out_dir), list(quantization)))
-        directory = Path(f"{out_dir}_gguf")
-        directory.mkdir(parents=True, exist_ok=True)
-        files = [str(directory / f"model.{q}.gguf") for q in quantization]
-        for f in files:
-            Path(f).write_bytes(b"gguf")
-        return str(directory), files
-
-    def push(self, model, tokenizer, repo_id, method, *, private=True, quantization=None):
-        self.calls.append(("push", repo_id, method, private))
-
-    def of(self, name):
-        return [c for c in self.calls if c[0] == name]
 
 
 @pytest.fixture
@@ -155,7 +51,7 @@ def pipeline(tmp_path, **over):
                      {"source": {"path": str(tmp_path / "alpaca.jsonl")}, "format": "alpaca"}],
             "text": [{"source": {"path": str(tmp_path / "corpus.jsonl")}, "chunk_chars": 200}],
             "preference": [{"source": {"path": str(tmp_path / "prefs.jsonl")}}],
-            "eval_fraction": 0.1,
+            "eval_fraction": 0.25,
         }},
         {"name": "eval_base", "kind": "llm.eval",
          "params": {"init_from": "org/base", "eval_data": "${data.chat_eval}", "generate_samples": 0}},
@@ -231,7 +127,7 @@ def test_full_pipeline_chains_models_and_reports_metrics(sources, backend):
     assert ("save_merged", str(run / "sft_broad" / "merged_base"), "merged_16bit") in backend.calls
     assert ("load", str(run / "sft_broad" / "merged_base"), "4bit", False) in backend.calls
     sft_lora = backend.of("attach_lora")[1][1]
-    assert sft_lora["r"] == 8 and sft_lora["lora_alpha"] == 16 and sft_lora["modules_to_save"] is None
+    assert sft_lora["r"] == 8 and sft_lora["lora_alpha"] == 32 and sft_lora["modules_to_save"] is None
     sft_call = backend.of("train_text")[1][1]
     assert sft_call["train"][0].startswith("<|system|>Be brief.</s><|user|>") or sft_call["train"][0].startswith("<|user|>")
     assert sft_call["responses_only"] is not None and sft_call["responses_only"].instruction_part is None
@@ -253,7 +149,7 @@ def test_full_pipeline_chains_models_and_reports_metrics(sources, backend):
     # dpo: merges by default, so the reference policy is the new adapter's base; conversational rows
     dpo_call = backend.of("train_dpo")[0][1]
     assert dpo_call["model"] == str(run / "dpo" / "merged_base") and manifests["dpo"].notes["mode"] == "adapter:merge"
-    assert backend.of("attach_lora")[2][1]["r"] == 16
+    assert backend.of("attach_lora")[2][1]["r"] == 32
     assert dpo_call["config"]["beta"] == 0.2 and dpo_call["config"]["learning_rate"] == 5e-6 and "loss_type" not in dpo_call["config"]
     assert set(dpo_call["train"][0]) == {"prompt", "chosen", "rejected"}
 
@@ -382,7 +278,7 @@ def test_importing_the_track_needs_no_training_library():
     code = (
         "import sys, stagetrain.tracks.llm\n"
         "from stagetrain.core import kinds\n"
-        "assert set(kinds('llm')) == {'llm.prepare_data', 'llm.cpt', 'llm.sft', 'llm.dpo', 'llm.eval', 'llm.export'}\n"
+        "assert set(kinds('llm')) == {'llm.prepare_data', 'llm.cpt', 'llm.sft', 'llm.dpo', 'llm.grpo', 'llm.eval', 'llm.export', 'llm.select', 'llm.select_checkpoint', 'llm.generate_data'}\n"
         "heavy = [m for m in ('torch', 'transformers', 'trl', 'unsloth', 'datasets', 'peft') if m in sys.modules]\n"
         "assert not heavy, heavy\n"
     )

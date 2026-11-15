@@ -60,7 +60,7 @@ def test_load_kwargs():
 def test_peft_kwargs():
     kw = peft_kwargs(LlmLora(), seed=7)
     assert set(kw) <= GET_PEFT_MODEL
-    assert kw["r"] == 16 and kw["lora_alpha"] == 16 and kw["random_state"] == 7 and kw["modules_to_save"] is None
+    assert kw["r"] == 32 and kw["lora_alpha"] == 32 and kw["random_state"] == 7 and kw["modules_to_save"] is None
     assert kw["target_modules"] == ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     assert kw["use_gradient_checkpointing"] == "unsloth"
     # a config that only sets the rank keeps Unsloth's modules

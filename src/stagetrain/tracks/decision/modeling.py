@@ -16,9 +16,10 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from .prompt import PromptStyle, Verbalizer, encode_prompt
-from .schema import CHOICE, SCORE, TYPES, Record
+from .schema import CHOICE, NOUL, SCORE, TYPES, Question, Record
 
 META_FILE = "decision.json"
+NONE_OPTION = "none_of_the_above"
 
 
 class LossConfig(BaseModel):
@@ -38,6 +39,11 @@ class AugmentConfig(BaseModel):
     description_dropout: float = 0.0  # chance that a choice shows option names without descriptions
     mix_option_format: bool = False  # alternate between "name: description" and description-only lines
     mix_state_format: bool = False  # alternate between JSON and sectioned states
+    # The three below change the question itself, so that the model meets option counts and
+    # question shapes its sources do not have. Each is a chance per choice record with a hard answer.
+    subsample_options: float = 0.0  # keep the answer and a random subset of the other options
+    none_of_the_above: float = 0.0  # add a "none of the other options" option; half the time it is the answer
+    derive_noul: float = 0.0  # ask "is <one option> the right answer?" as a yes/no question instead
 
 
 # --------------------------------------------------------------------------- #
@@ -80,7 +86,42 @@ class DecisionCollator:
             self._rng = random.Random(self.seed + (worker.id + 1) * 100_003 if worker else self.seed)
         return self._rng
 
+    def reshape(self, record: Record) -> Record:
+        """One of the question-changing augmentations, or the record unchanged."""
+        a, q = self.augment, record.question
+        if a is None or q.type != CHOICE or max(record.target) < 1.0:
+            return record
+        rng = self.rng()
+        gold, n = record.answer_index, len(q.names)
+        roll = rng.random()
+        if roll < a.derive_noul:
+            # Half of the derived questions propose the right option, half a wrong one.
+            proposed = gold if rng.random() < 0.5 else rng.choice([i for i in range(n) if i != gold])
+            shown = q.descriptions[proposed] or q.names[proposed].replace("_", " ")
+            question = Question(
+                NOUL, f"{q.instructions}\nProposed answer: {shown}\nIs the proposed answer correct?", ("yes", "no"), (None, None)
+            )
+            return Record(record.id, record.source, record.state, question, (1.0, 0.0) if proposed == gold else (0.0, 1.0))
+        roll -= a.derive_noul
+        if roll < a.none_of_the_above:
+            keep = list(range(n))
+            answer_removed = n > 2 and rng.random() < 0.5
+            if answer_removed:
+                keep.remove(gold)
+            names = tuple(q.names[i] for i in keep) + (NONE_OPTION,)
+            descriptions = tuple(q.descriptions[i] for i in keep) + ("None of the other options applies.",)
+            target = tuple(0.0 for _ in keep) + (1.0,) if answer_removed else tuple(float(i == gold) for i in keep) + (0.0,)
+            return Record(record.id, record.source, record.state, Question(CHOICE, q.instructions, names, descriptions), target)
+        roll -= a.none_of_the_above
+        if roll < a.subsample_options and n > 2:
+            others = rng.sample([i for i in range(n) if i != gold], rng.randint(1, n - 2))
+            keep = sorted([gold, *others])
+            question = Question(CHOICE, q.instructions, tuple(q.names[i] for i in keep), tuple(q.descriptions[i] for i in keep))
+            return Record(record.id, record.source, record.state, question, tuple(float(i == gold) for i in keep))
+        return record
+
     def encode(self, record: Record) -> dict[str, Any]:
+        record = self.reshape(record)
         question, target, style = record.question, list(record.target), self.style
         order = list(range(len(target)))
         if question.type == CHOICE:
@@ -274,7 +315,7 @@ def read_meta(model_dir: str | Path) -> dict[str, Any]:
 
 
 def write_meta(
-    model_dir: str | Path, style: PromptStyle, max_length: int | None, calibration: Mapping[str, float] | None = None,
+    model_dir: str | Path, style: PromptStyle, max_length: int | None, calibration: Mapping[str, Any] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> Path:
     path = Path(model_dir) / META_FILE

@@ -1,7 +1,9 @@
-# Embedding track, shorter recipe: adapt an existing embedding model to a domain with a
-# cross-encoder teacher. There is no pre-training stage; the published model mines its own negatives.
+# The shortest useful recipe: one small multilingual embedder, one teacher, one training run.
 #
-#   data ─► mine (teacher rescoring, scores kept) ─► finetune (InfoNCE + margin distillation) ─► eval ─► export
+#   data ─> untuned ─> mine (teacher rescoring, scores kept) ─> finetune (listwise distillation) ─> test ─> export
+#
+# The model mines its own negatives here, which keeps the recipe to two models. A stronger miner
+# finds better ones: set `vars.miner` to a larger embedder (as configs/embeddings/retrieval.yaml does).
 #
 #   stagetrain run configs/embeddings/distill.yaml --set vars.pairs=/data/my_pairs.jsonl
 
@@ -11,9 +13,12 @@ seed: 42
 
 vars:
   base_model: intfloat/multilingual-e5-small
+  miner: intfloat/multilingual-e5-small
   teacher: BAAI/bge-reranker-v2-m3
   pairs: sentence-transformers/natural-questions   # or a local .jsonl / .parquet with query, positive columns
-  prompts: {query: "query: ", document: "passage: "}
+  encoder: &encoder
+    max_seq_length: 512
+    prompts: {query: "query: ", document: "passage: "}   # the prefixes e5 was trained with
 
 stages:
   - name: data
@@ -22,30 +27,32 @@ stages:
       sources:
         - path: ${vars.pairs}
           columns: {query: query, positive: answer}
-      eval_fraction: 0.05
+          max_samples: 30000
+      eval_fraction: 0.03
+      test_fraction: 0.05
       max_eval_queries: 1000
 
-  - name: baseline
+  - name: untuned
     kind: embeddings.eval          # the published model, before any training: the number to beat
     params:
       model: ${vars.base_model}
-      eval_set: ${data.eval_set}
-      encoder: {prompts: "${vars.prompts}", max_seq_length: 512}
+      eval_set: ${data.test_set}
+      encoder: *encoder
 
   - name: mine
     kind: embeddings.mine_negatives
     params:
-      model: ${vars.base_model}
+      model: ${vars.miner}
       train_data: ${data.train}
       corpus: ${data.corpus}
-      cross_encoder: ${vars.teacher}   # rescoring: the filters and the written scores are the teacher's
+      cross_encoder: ${vars.teacher}   # rescoring: the filter and the written scores are the teacher's
+      teacher_scores: probability      # sigmoid outputs in (0, 1), so the margin below is relative
+      relative_margin: 0.05            # keep candidates the teacher scores under 95 % of the positive
+      range_max: 40
+      num_negatives: 7
       output_scores: true
-      num_negatives: 4
-      range_min: 0
-      range_max: 50
-      relative_margin: null
-      absolute_margin: 1.0             # teacher logits: keep negatives at least 1.0 below the positive
-      encoder: {prompts: "${vars.prompts}", max_seq_length: 512}
+      encoder: *encoder
+    gate: {metric: mine/kept_fraction, min: 0.5}
 
   - name: finetune
     kind: embeddings.finetune
@@ -53,29 +60,31 @@ stages:
       init_from: ${vars.base_model}
       train_data: ${mine.train}
       eval_set: ${data.eval_set}
-      encoder: {prompts: "${vars.prompts}", max_seq_length: 512}
+      encoder: *encoder
       loss:
         name: mnrl
-        distill_weight: 0.05           # + 0.05 x MarginMSE on the teacher's score margins
-        distill_similarity: cosine     # e5 ends in Normalize: match 20 x cosine to the teacher's logits
-        distill_scale: 20
+        distill_weight: 1.0            # listwise KL on the teacher's ranking of [positive, 7 negatives]
+        contrastive_weight: 0.1        # + 0.1 x InfoNCE
       train:
         learning_rate: 1.0e-5
         num_train_epochs: 1
         per_device_train_batch_size: 32
         warmup: 0.1
         eval_steps: 500
-    gate: {metric: eval/ndcg@10, baseline: baseline.eval/ndcg@10, max_drop: 0.0}
+        load_best_model_at_end: true
+        metric_for_best_model: eval_ir_cosine_ndcg@10
+        greater_is_better: true
 
-  - name: eval
+  - name: test
     kind: embeddings.eval
     params:
       model: ${finetune.model}
-      eval_set: ${data.eval_set}
-    gate: {metric: eval/ndcg@10, baseline: baseline.eval/ndcg@10, max_drop: 0.0}
+      eval_set: ${data.test_set}
+      compare_to: ${untuned.scores}
+    gate: {metric: eval/delta_ci_low, min: 0.0}   # better than the untuned model, beyond chance
 
   - name: export
     kind: embeddings.export
-    needs: [eval]
+    needs: [test]
     params:
       model: ${finetune.model}

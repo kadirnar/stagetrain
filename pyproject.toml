@@ -37,12 +37,14 @@ classifiers = [
     "datasets",
     "accelerate",
     "numpy",
+    "scikit-learn",  # the TF-IDF baseline
 ]
 embeddings = [
     "torch",
     "sentence-transformers",
     "datasets",
     "accelerate",
+    "numpy",
 ]
 # Optional: `export.onnx: true` in the classifiers track.
 onnx = [
@@ -52,7 +54,7 @@ onnx = [
 dev = [
     "pytest>=8",
     "ruff>=0.6",
-    "scikit-learn",  # the tests check the classifiers' numpy metrics against it
+    "scikit-learn",
 ]
 
 [project.scripts]

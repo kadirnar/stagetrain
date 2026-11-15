@@ -129,6 +129,42 @@ def test_shuffling_moves_the_answer_with_its_option(tok):
     assert "praise" not in tok.decode(dropped.encode(record)["ids"])
 
 
+def test_question_changing_augmentations(tok):
+    record = records()[0]  # a choice among positive / negative / neutral, answer: negative
+
+    derived = DecisionCollator(tok, PromptStyle(), 160, AugmentConfig(shuffle_options=False, derive_noul=1.0), seed=1)
+    answers = set()
+    for _ in range(20):
+        e = derived.encode(record)
+        text = tok.decode(e["ids"])
+        assert e["type"] == "noul" and "Proposed answer" in text
+        proposed_gold = "Proposed answer : complaint" in text  # the description of "negative"
+        assert e["target"] == ([1.0, 0.0] if proposed_gold else [0.0, 1.0])
+        answers.add(proposed_gold)
+    assert answers == {True, False}  # right and wrong proposals both occur
+
+    nota = DecisionCollator(tok, PromptStyle(), 160, AugmentConfig(shuffle_options=False, none_of_the_above=1.0), seed=2)
+    seen = set()
+    for _ in range(20):
+        e = nota.encode(record)
+        text = tok.decode(e["ids"])
+        assert "None of the other options applies" in text and sum(e["target"]) == 1.0
+        removed = "complaint" not in text  # the answer was taken out, so "none" is right
+        assert len(e["target"]) == (3 if removed else 4) and (e["target"][-1] == 1.0) == removed
+        seen.add(removed)
+    assert seen == {True, False}
+
+    fewer = DecisionCollator(tok, PromptStyle(), 160, AugmentConfig(shuffle_options=False, subsample_options=1.0), seed=3)
+    e = fewer.encode(record)
+    assert len(e["target"]) == 2 and sum(e["target"]) == 1.0 and "complaint" in tok.decode(e["ids"])
+
+    # yes/no and score questions, and soft-labelled choices, are left as they are
+    for other in records()[1:]:
+        assert derived.encode(other)["type"] == other.question.type
+    soft = Record.parse({"state": "s", "question": CHOICE, "target": [0.5, 0.5, 0.0]})
+    assert derived.encode(soft)["type"] == "choice"
+
+
 # ------------------------------------------------------------------------ loss
 
 
@@ -194,7 +230,8 @@ def run(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("decision")
     base = build_model_dir(tmp / "base")
     write_jsonl(tmp / "reviews.jsonl", reviews(900, seed=0))
-    data = {"path": str(tmp / "reviews.jsonl")}
+    write_jsonl(tmp / "held.jsonl", reviews(900, seed=1))
+    data, held = {"path": str(tmp / "reviews.jsonl")}, {"path": str(tmp / "held.jsonl")}
     train = {"learning_rate": 3e-3, "num_train_epochs": 3, "per_device_train_batch_size": 16, "logging_steps": 50,
              "warmup": 0.05, "weight_decay": 0.0, "precision": "fp32", "extra": {"use_cpu": True}}
     member = {"init_from": "${align.model}", "train_data": "${data.train}", "eval_data": "${data.eval}",
@@ -212,24 +249,30 @@ def run(tmp_path_factory):
                  "instructions": "Is the review positive?", "eval_fraction": 0.1, "calibration_fraction": 0.1},
                 {"name": "stars", "task": "rating", "data": data, "instructions": "How good is it?",
                  "levels": LEVELS, "eval_fraction": 0.1, "calibration_fraction": 0.1},
+                # two sources no stage trains on: the temperature is fitted and the model judged on them
+                {"name": "held_topic", "task": "classification", "role": "heldout",
+                 "data": {**held, "columns": {"label": "name"}}, "instructions": "Which sentiment does the review have?",
+                 "descriptions": {"positive": "praise", "negative": "complaint"}},
+                {"name": "held_positive", "task": "binary", "role": "heldout",
+                 "data": {**held, "columns": {"label": "is_positive"}}, "instructions": "Is the review positive?"},
             ]}},
             {"name": "align", "kind": "decision.train", "params": {
                 "init_from": str(base), "train_data": "${data.train}", "eval_data": "${data.eval}",
                 "max_length": 96, "lora": None, "train": train, "augment": {"shuffle_options": False},
                 "loss": {"label_smoothing": 0.05, "ordinal_sigma": 0.5}},
              "gate": {"metric": "eval/accuracy", "min": 0.9}},
-            {"name": "full-a", "kind": "decision.train",
-             "params": {**member, "seed": 1, "augment": {"shuffle_options": False}}},
-            {"name": "full-b", "kind": "decision.train",
-             "params": {**member, "seed": 2, "mixture": {"stars": 0.5}, "augment": {"shuffle_options": False}}},
+            # one stage, two seeds; the soup takes every run of the matrix
+            {"name": "full", "kind": "decision.train", "matrix": {"seed": [1, 2]},
+             "params": {**member, "mixture": {"stars": 0.5}, "augment": {"shuffle_options": False}}},
             {"name": "soup", "kind": "decision.soup", "params": {
-                "models": ["${full-a.model}", "${full-b.model}"], "method": "greedy", "data": "${data.calibration}",
-                "precision": "fp32"}},
+                "group": "full", "method": "greedy", "data": "${data.calibration}", "precision": "fp32"}},
             {"name": "calibrate", "kind": "decision.calibrate", "params": {
-                "model": "${soup.model}", "data": "${data.calibration}", "precision": "fp32"}},
+                "model": "${soup.model}", "data": "${data.heldout_calibration}", "min_examples": 30, "precision": "fp32"}},
+            {"name": "eval-align", "kind": "decision.eval", "params": {
+                "model": "${align.model}", "data": "${data.heldout_eval}", "blind_probe": False, "precision": "fp32"}},
             {"name": "eval", "kind": "decision.eval", "params": {
-                "model": "${soup.model}", "data": "${data.eval}", "calibration": "${calibrate.calibration}",
-                "permutations": 2, "precision": "fp32"},
+                "model": "${soup.model}", "data": "${data.heldout_eval}", "calibration": "${calibrate.calibration}",
+                "permutations": 2, "compare_to": "${eval-align.predictions}", "precision": "fp32"},
              "gate": [{"metric": "eval/accuracy", "baseline": "align.eval/accuracy", "max_drop": 0.05},
                       {"metric": "eval/blind_gap", "min": 0.2}]},
             {"name": "export", "kind": "decision.export", "params": {
@@ -242,14 +285,21 @@ def run(tmp_path_factory):
 
 
 def test_pipeline_trains_a_decision_model(run):
-    m = {name: run.manifest(name) for name in ("data", "align", "full-a", "full-b", "soup", "calibrate", "eval", "export")}
+    m = {name: run.manifest(name) for name in ("data", "align", "full-1", "full-2", "soup", "calibrate", "eval-align", "eval", "export")}
     assert all(x.completed for x in m.values())
-    assert m["data"].metrics["data/sources"] == 3 and m["data"].metrics["data/train"] > 1500
+    assert m["data"].metrics["data/sources"] == 5 and m["data"].metrics["data/train"] > 1500
+    assert m["data"].metrics["data/heldout_sources"] == 2
+    assert m["data"].metrics["data/heldout_eval"] > 300 and m["data"].metrics["data/heldout_calibration"] > 300
+    assert m["data"].notes["audit"]["held_topic"]["role"] == "heldout"
+    trained_on = {json.loads(line)["source"] for line in open(run.manifest("data").artifact("train", run.run_dir))}
+    assert trained_on == {"topic", "positive", "stars"}  # no held-out row is trained on
     assert m["data"].metrics["data/duplicates"] > 0  # 900 rows of a small vocabulary repeat; repeats are dropped
     assert m["align"].metrics["eval/accuracy"] >= 0.9
     assert m["align"].metrics["train/loss"] < 1.5
-    assert "adapter" in m["full-a"].artifacts and "adapter" not in m["align"].artifacts
-    assert m["full-b"].metrics["train/records"] < m["full-a"].metrics["train/records"]  # its mixture halves a source
+    assert "adapter" in m["full-1"].artifacts and "adapter" not in m["align"].artifacts
+    assert m["full-1"].variant == {"seed": 1} and m["full-2"].params["seed"] == 2
+    assert m["full-1"].metrics["train/records"] < m["align"].metrics["train/records"]  # its mixture halves a source
+    assert len(m["soup"].notes["models"]) == 2 and m["soup"].notes["models"][0].endswith("full-1/model")
     assert 1 <= m["soup"].metrics["soup/members"] <= 2
     assert m["soup"].metrics["soup/nll"] <= m["soup"].metrics["soup/best_single_nll"] + 1e-9
 
@@ -257,19 +307,29 @@ def test_pipeline_trains_a_decision_model(run):
 def test_calibration_and_eval_probes(run):
     cal, ev = run.manifest("calibrate").metrics, run.manifest("eval").metrics
     assert cal["calibration/nll_after"] <= cal["calibration/nll_before"] + 1e-9
-    assert all(cal[f"calibration/temperature_{t}"] > 0 for t in TYPES)
-    assert ev["eval/accuracy"] >= 0.85 and ev["eval/accuracy_noul"] >= 0.85
+    assert all(0.5 <= cal[f"calibration/temperature_{t}"] <= 5.0 for t in ("noul", "choice"))  # inside the bounds
+    assert cal["calibration/temperature_score"] == 1.0  # the held-out sources have no score question
+    assert "calibration/nll_out_of_fold" in cal and cal["calibration/at_bound"] >= 0
+    fitted = json.loads(open(run.manifest("calibrate").artifact("calibration", run.run_dir)).read())
+    assert set(fitted) == {"temperature", "bands", "n"}
+    assert ev["eval/accuracy"] >= 0.85 and ev["eval/accuracy_noul"] >= 0.85 and ev["eval/macro_skill"] >= 0.7
+    assert ev["eval/accuracy_ci_low"] <= ev["eval/accuracy"] <= ev["eval/accuracy_ci_high"]
+    assert ev["eval/confident_errors"] <= 0.05
     assert ev["eval/blind_gap"] >= 0.2  # without the state the model falls back to the answer prior
     assert 0 <= ev["eval/permutation_consistency"] <= 1
-    assert "eval/nll_uncalibrated" in ev and "eval/noul_auroc" in ev and "eval/score_mae" in ev
+    assert "eval/nll_uncalibrated" in ev and "eval/noul_auroc" in ev
+    # the same held-out records answered by the model before the soup: a paired difference with its interval
+    assert ev["eval/delta_n"] == ev["eval/n"] and abs(ev["eval/delta_accuracy"]) <= 0.1
+    assert ev["eval/delta_accuracy_ci_low"] <= ev["eval/delta_accuracy"] <= ev["eval/delta_accuracy_ci_high"]
     report = json.loads(open(run.manifest("eval").artifact("report", run.run_dir)).read())
-    assert set(report["by_source"]) == {"topic", "positive", "stars"}
+    assert set(report["by_source"]) == {"held_topic", "held_positive"} and "skill" in report["by_source"]["held_topic"]
 
 
 def test_exported_model_answers_typed_questions(run):
     path = run.manifest("export").artifact("model", run.run_dir)
     meta = read_meta(path)
-    assert meta["calibration"] and meta["max_length"] == 96 and meta["prompt"]["question_header"] == "QUESTION:"
+    assert set(meta["calibration"]) == {"temperature", "bands"} and "init_from" not in meta
+    assert meta["max_length"] == 96 and meta["prompt"]["question_header"] == "QUESTION:"
     model = DecisionModel.load(path, precision="fp32", device="cpu")
     questions = {
         "topic": {"type": "choice", "instructions": "Which sentiment does the review have?",
@@ -285,6 +345,13 @@ def test_exported_model_answers_typed_questions(run):
     assert sum(good["answers"]["topic"]["probabilities"].values()) == pytest.approx(1.0)
     assert good["usage"]["output_tokens"] == 0 and good["usage"]["input_tokens"] > 0
     assert model.decide("the movie was superb", {"positive": NOUL})["answers"]["positive"]["noul"] > 0.5
+    # averaging over option orders: the same kind of answer, probabilities in the record's own option order
+    averaged = DecisionModel.load(path, precision="fp32", device="cpu", orders=3)
+    both = averaged.decide("the movie was excellent and story", questions)
+    assert set(both["answers"]["topic"]["probabilities"]) == {"negative", "neutral", "positive"}
+    assert sum(both["answers"]["topic"]["probabilities"].values()) == pytest.approx(1.0)
+    assert both["usage"]["input_tokens"] > good["usage"]["input_tokens"]  # three passes for the choice question
+    assert both["answers"]["positive"]["noul"] == pytest.approx(good["answers"]["positive"]["noul"], abs=1e-5)
 
 
 def test_a_second_run_is_fully_cached(run):

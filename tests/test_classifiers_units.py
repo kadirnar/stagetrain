@@ -28,7 +28,8 @@ CONFIGS = sorted((Path(__file__).parent.parent / "configs" / "classifiers").glob
 def test_stage_kinds_are_registered():
     assert set(kinds("classifiers")) == {
         "classifiers.prepare_data", "classifiers.mlm_adapt", "classifiers.finetune", "classifiers.pseudo_label",
-        "classifiers.calibrate", "classifiers.eval", "classifiers.export",
+        "classifiers.calibrate", "classifiers.eval", "classifiers.export", "classifiers.select",
+        "classifiers.baseline", "classifiers.audit_labels",
     }
 
 
@@ -316,3 +317,153 @@ def test_llrd_groups():
     assert list(layer_depths(modern, "model").values()) == [0, 1, 22, 23, None, None]
     flat = llrd_groups(named, lr=1e-3, decay=1.0, weight_decay=0.0)
     assert len(flat) == 1 and flat[0]["lr"] == 1e-3
+
+
+# ------------------------------------------------- what the research added
+
+
+def test_logit_adjusted_loss_adds_the_prior_in_training_only():
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as F
+
+    from stagetrain.tracks.classifiers.modeling import classification_loss, log_prior
+
+    bias = log_prior([80, 10, 10], tau=1.0)
+    assert bias == pytest.approx([math.log(0.8), math.log(0.1), math.log(0.1)])
+    assert log_prior([80, 10, 10], tau=2.0) == pytest.approx([2 * b for b in bias])
+    assert log_prior([9, 1, 0])[2] == pytest.approx(math.log(0.1))  # an unseen class gets the rarest seen frequency
+    with pytest.raises(ValueError, match="no class counts"):
+        log_prior([])
+
+    torch.manual_seed(0)
+    logits, y = torch.randn(6, 3), torch.tensor([0, 0, 0, 1, 2, 0])
+    onehot = F.one_hot(y, 3).float()
+    adjusted = classification_loss(logits, onehot, logit_bias=torch.tensor(bias))
+    assert adjusted.item() == pytest.approx(F.cross_entropy(logits + torch.tensor(bias), y).item(), rel=1e-6)
+    # With equal raw logits the rare classes cost more, so training pushes their logits up.
+    flat = torch.zeros(1, 3)
+    rare = classification_loss(flat, torch.tensor([[0.0, 1.0, 0.0]]), logit_bias=torch.tensor(bias))
+    common = classification_loss(flat, torch.tensor([[1.0, 0.0, 0.0]]), logit_bias=torch.tensor(bias))
+    assert rare.item() > common.item()
+    with pytest.raises(ValueError, match="single-label"):
+        classification_loss(torch.zeros(2, 3), torch.zeros(2, 3), problem_type=MULTI, logit_bias=torch.tensor(bias))
+
+
+def test_headline_matches_the_full_report():
+    np = pytest.importorskip("numpy")
+    from stagetrain.tracks.classifiers.metrics import classification_report, headline
+
+    rng = np.random.default_rng(0)
+    y, pred = rng.integers(0, 4, 300), rng.integers(0, 4, 300)
+    full = classification_report(pred, y, list("abcd"), SINGLE)["metrics"]
+    assert headline(pred, y, SINGLE, 4) == pytest.approx((full["accuracy"], full["macro_f1"]))
+    ym, pm = rng.random((200, 5)) < 0.3, rng.random((200, 5)) < 0.3
+    full = classification_report(pm, ym, list("abcde"), MULTI)["metrics"]
+    assert headline(pm, ym, MULTI, 5) == pytest.approx((full["accuracy"], full["macro_f1"]))
+    assert headline(np.array([0, 0]), np.array([0, 0]), SINGLE, 3) == (1.0, 1.0)  # classes that never occur are left out
+
+
+def test_bootstrap_intervals_and_paired_difference():
+    np = pytest.importorskip("numpy")
+    from stagetrain.tracks.classifiers.metrics import bootstrap_intervals, headline, paired_bootstrap
+
+    rng = np.random.default_rng(1)
+    y = rng.integers(0, 3, 600)
+    base = np.where(rng.random(600) < 0.8, y, (y + 1) % 3)  # right four times in five
+    better = np.where((base != y) & (rng.random(600) < 0.25), y, base)  # the same answers, a quarter of the errors fixed
+    accuracy, macro = headline(base, y, SINGLE, 3)
+    ci = bootstrap_intervals(base, y, SINGLE, 3, samples=400, seed=0)
+    assert ci["accuracy"][0] < accuracy < ci["accuracy"][1] and ci["macro_f1"][0] < macro < ci["macro_f1"][1]
+    assert 0.04 < ci["accuracy"][1] - ci["accuracy"][0] < 0.09  # about +-3 points at 80 % on 600 rows
+    assert bootstrap_intervals(base, y, SINGLE, 3, samples=400, seed=0) == ci  # the same seed, the same draw
+
+    diff = paired_bootstrap(better, base, y, SINGLE, 3, samples=400, seed=0)
+    assert diff["accuracy"]["delta"] == pytest.approx(headline(better, y, SINGLE, 3)[0] - accuracy)
+    assert diff["accuracy"]["ci_low"] > 0 and diff["macro_f1"]["ci_low"] > 0  # better beyond chance...
+    own = bootstrap_intervals(better, y, SINGLE, 3, samples=400, seed=0)
+    assert own["accuracy"][0] < ci["accuracy"][1]  # ...although the two models' own intervals overlap
+    same = paired_bootstrap(base, base, y, SINGLE, 3, samples=100)
+    assert same["macro_f1"] == {"delta": 0.0, "ci_low": 0.0, "ci_high": 0.0}
+
+
+def test_rare_labels_share_one_threshold():
+    np = pytest.importorskip("numpy")
+    from stagetrain.tracks.classifiers.metrics import fit_thresholds
+
+    rng = np.random.default_rng(2)
+    y = np.zeros((200, 3), dtype=int)
+    y[:100, 0] = 1  # a common label: 100 positives
+    y[:3, 1] = 1  # a rare one: 3 positives
+    probs = np.clip(0.2 + 0.25 * y + rng.normal(0, 0.05, y.shape), 0.01, 0.99)  # positives sit near 0.45
+    own = fit_thresholds(probs, y)
+    assert own[2] == 0.5 and own[0] < 0.5 and own[1] < 0.5  # every label with a positive gets its own cut
+    shared = fit_thresholds(probs, y, min_positives=10)
+    assert shared[0] == own[0] and shared[1] == shared[2] and shared[1] < 0.5  # the rare labels take the common cut
+    assert fit_thresholds(probs, np.zeros_like(y), min_positives=10) == [0.5, 0.5, 0.5]
+
+
+def test_row_losses_and_probability_nll():
+    np = pytest.importorskip("numpy")
+    from stagetrain.tracks.classifiers.metrics import (
+        nll,
+        nll_of_probabilities,
+        probabilities,
+        row_losses,
+        targets_array,
+    )
+
+    logits = np.array([[4.0, 0.0, 0.0], [0.0, 4.0, 0.0], [4.0, 0.0, 0.0]])
+    y = np.array([0, 1, 2])
+    losses = row_losses(logits, y, SINGLE)
+    assert losses[2] > 3.9 and losses[0] == pytest.approx(losses[1]) and losses.mean() == pytest.approx(nll(logits, y, SINGLE))
+    assert nll_of_probabilities(probabilities(logits, SINGLE), y, SINGLE) == pytest.approx(nll(logits, y, SINGLE))
+    ym = np.array([[1, 0, 0], [0, 1, 1], [0, 0, 0]])
+    assert row_losses(logits, ym, MULTI).mean() == pytest.approx(nll(logits, ym, MULTI))
+    assert nll_of_probabilities(probabilities(logits, MULTI), ym, MULTI) == pytest.approx(nll(logits, ym, MULTI), rel=1e-6)
+    rows = [{"labels": [0]}, {"labels": [1, 2]}, {"labels": []}]
+    assert targets_array(rows, 3, MULTI).tolist() == ym.tolist()
+    assert targets_array([{"label": 2}, {"label": 0}], 3, SINGLE).tolist() == [2, 0]
+
+
+def test_folds_and_suspect_ranking():
+    from stagetrain.tracks.classifiers.post import rank_suspects, row_id
+    from stagetrain.tracks.classifiers.train import fold_of
+
+    rows = [{"text": f"text number {i}"} for i in range(300)]
+    folds = [fold_of(r, 5) for r in rows]
+    assert set(folds) == {0, 1, 2, 3, 4} and min(folds.count(f) for f in range(5)) > 35
+    assert folds == [fold_of(r, 5) for r in rows]  # the text decides, nothing else
+    assert fold_of({"text": "Same  Text"}, 5) == fold_of({"text": "same text"}, 5)
+
+    oof = [
+        {"text": "fine", "label": 0, "loss": 0.1, "probs": [0.9, 0.1], "fold": 0},
+        {"text": "wrong label", "label": 0, "loss": 3.0, "probs": [0.05, 0.95], "fold": 1},
+        {"text": "wrong label", "label": 0, "loss": 2.0, "probs": [0.15, 0.85], "fold": 1},  # a second seed's run
+        {"text": "multi", "labels": [0], "loss": 1.0, "probs": [0.9, 0.7], "fold": 2},
+    ]
+    ranked = rank_suspects(oof)
+    assert [r["text"] for r in ranked] == ["wrong label", "multi", "fine"]
+    top = ranked[0]
+    assert top["loss"] == 2.5 and top["runs"] == 2 and top["probs"] == pytest.approx([0.1, 0.9])
+    assert top["predicted"] == 1 and top["disagrees"] and top["id"] == row_id({"text": "WRONG label"})
+    assert ranked[1]["predicted"] == [0, 1] and ranked[1]["disagrees"] and not ranked[2]["disagrees"]
+
+
+@pytest.mark.parametrize("params, message", [
+    ({"data": "pool.jsonl"}, "needs a teacher"),
+    ({"data": "pool.jsonl", "models": ["a"], "model": "b"}, "models, or group, or a single model"),
+    ({"data": "pool.jsonl", "model": "a", "ensemble": "winner"}, "needs group"),
+    ({"data": "pool.jsonl", "group": "g", "ensemble": "winner"}, "needs model"),
+    ({"data": "pool.jsonl", "models": ["a", "b"], "calibration": "c.json"}, "single teacher"),
+])
+def test_pseudo_label_teacher_parameters(params, message):
+    from pydantic import ValidationError
+
+    from stagetrain.tracks.classifiers.post import AuditParams, PseudoLabelParams
+
+    with pytest.raises(ValidationError, match=message):
+        PseudoLabelParams(**params)
+    assert PseudoLabelParams(data="p.jsonl", models=["a", "b"]).ensemble == "all"
+    with pytest.raises(ValidationError, match="needs train_data"):
+        AuditParams(group="cv", labels="l.json", drop_fraction=0.1)
+

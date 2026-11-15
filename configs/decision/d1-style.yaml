@@ -1,55 +1,72 @@
 # A d1-style decision model: a causal LM that answers typed questions (yes/no, choice, score) over a
 # state in one forward pass, read at the answer slot, with no generated tokens.
 #
-#   stagetrain plan configs/decision/d1-style.yaml
-#   stagetrain run  configs/decision/d1-style.yaml
+#   data ──> train x3 (seeds) ──> soup ──> calibrate (on unseen sources) ──> eval_heldout ──> export
+#        └─> eval_base (the untrained model, same prompt, same records)   └─> eval_seen
 #
-# The thresholds in the gates are starting points, not measured results: set them from your own
-# first run.
+#   stagetrain plan   configs/decision/d1-style.yaml
+#   stagetrain run    configs/decision/d1-style.yaml
+#   stagetrain report configs/decision/d1-style.yaml --open
+#
+# What is here and what is left out follows docs/research/decision.md. Two limits of this file:
+# 14 training sources is still few (breadth is the largest lever; 50 to 300 is where others
+# work), and the gate thresholds are starting points, not measured results.
+
 track: decision
 name: d1-style-qwen3-0.6b
 seed: 42
 
 vars:
   base_model: Qwen/Qwen3-0.6B
-  rows: 20000          # training rows read per source
-
-defaults:
-  decision.train:
-    train_data: "${data.train}"
-    eval_data: "${data.eval}"
-    max_eval_samples: 2000
-    # Qwen3's template opens a reasoning block unless told not to; the answer slot must come first.
-    prompt: {template_kwargs: {enable_thinking: false}}
-    lora: {r: 32, alpha: 64, target_modules: all-linear}
-    loss: {label_smoothing: 0.05, ordinal_sigma: 0.5, vocab_mass_weight: 0.1}
+  rows: 5000          # per source: unseen-question accuracy grows with the number of sources, not rows per source
+  # Qwen3's template opens a reasoning block unless told not to; the answer slot must come first.
+  prompt: &prompt {template_kwargs: {enable_thinking: false}}
 
 stages:
-  # 1. Labelled datasets -> decision records, split by content hash, audited for shortcuts.
+  # 1. Labelled datasets -> decision records. Three sources are held out whole: nothing trains on
+  #    them, the temperatures are fitted on one half of their rows and the model is judged on the other.
   - name: data
     kind: decision.build_data
     params:
       sources:
+        # --- yes / no
         - name: boolq
           task: binary
-          data: {path: google/boolq, split: train, columns: {label: answer}}
-          eval_data: {path: google/boolq, split: validation, columns: {label: answer}}
+          data: {path: google/boolq, split: train, columns: {label: answer}, max_samples: "${vars.rows}"}
           state_columns: {passage: passage, question: question}
           instructions:
             - Does the passage answer the question with yes?
             - According to the passage, is the answer to the question yes?
-        - name: toxicity
+        - name: toxicity            # the label is the share of annotators who said "toxic": kept as a soft target
           task: binary
           data: {path: google/civil_comments, split: train, columns: {label: toxicity},
                  streaming: true, shuffle: true, max_samples: "${vars.rows}"}
-          threshold: 0.5
+          threshold_soft: true
           instructions: Is this comment toxic?
           descriptions: {"true": "rude, disrespectful or hateful", "false": "civil, even if critical"}
-        - name: paraphrase
+        - name: sentiment
           task: binary
-          data: {path: google-research-datasets/paws-x, name: en, split: train, max_samples: "${vars.rows}"}
-          state_columns: {first: sentence1, second: sentence2}
-          instructions: Do the two sentences mean the same thing?
+          data: {path: nyu-mll/glue, name: sst2, split: train, columns: {text: sentence}, shuffle: true,
+                 max_samples: "${vars.rows}"}
+          instructions: Is the sentiment of this sentence positive?
+          buried_fraction: 0.1
+        - name: duplicate
+          task: binary
+          data: {path: nyu-mll/glue, name: qqp, split: train, streaming: true, shuffle: true,
+                 max_samples: "${vars.rows}"}
+          state_columns: {first: question1, second: question2}
+          instructions: Do the two questions ask the same thing?
+        - name: acceptability
+          task: binary
+          data: {path: nyu-mll/glue, name: cola, split: train, columns: {text: sentence}}
+          instructions: Is this sentence grammatically acceptable English?
+        - name: entailment
+          task: binary
+          data: {path: nyu-mll/glue, name: rte, split: train}
+          state_columns: {premise: sentence1, hypothesis: sentence2}
+          positive: ["0"]            # 0 is "entailment" in this dataset
+          instructions: Does the premise entail the hypothesis?
+        # --- one of N
         - name: topic
           task: classification
           data: {path: fancyzhx/ag_news, split: train, shuffle: true, max_samples: "${vars.rows}"}
@@ -57,9 +74,10 @@ stages:
           instructions:
             - Which section does this news item belong to?
             - What is this news item about?
+          buried_fraction: 0.1
         - name: nli
           task: classification
-          data: {path: facebook/xnli, name: en, split: train, streaming: true, shuffle: true,
+          data: {path: nyu-mll/glue, name: mnli, split: train, streaming: true, shuffle: true,
                  max_samples: "${vars.rows}"}
           state_columns: {premise: premise, hypothesis: hypothesis}
           label_names: [entailment, neutral, contradiction]
@@ -68,15 +86,34 @@ stages:
             neutral: the premise leaves the hypothesis open
             contradiction: the premise makes the hypothesis false
           instructions: How does the hypothesis relate to the premise?
-        - name: intent           # 77 options: past 26 the codes become two characters
+        - name: emotion
+          task: classification
+          data: {path: dair-ai/emotion, name: split, split: train, shuffle: true, max_samples: "${vars.rows}"}
+          instructions: Which emotion does this message express?
+          buried_fraction: 0.1
+        - name: entity_type
+          task: classification
+          data: {path: fancyzhx/dbpedia_14, split: train, streaming: true, shuffle: true,
+                 max_samples: "${vars.rows}"}
+          state_columns: {title: title, text: content}
+          label_names: [company, educational_institution, artist, athlete, office_holder, means_of_transportation,
+                        building, natural_place, village, animal, plant, album, film, written_work]
+          instructions: What kind of thing is this article about?
+        - name: intent               # 77 options: past 26 the codes become two characters
           task: classification
           data: {path: mteb/banking77, split: train, columns: {label: label_text}}
           eval_data: {path: mteb/banking77, split: test, columns: {label: label_text}}
           instructions: Which banking intent does the customer message express?
+          buried_fraction: 0.1
+        - name: assistant_intent     # 151 options, one of them "out of scope"
+          task: classification
+          data: {path: clinc/clinc_oos, name: plus, split: train, columns: {label: intent}}
+          instructions: Which request is the user making? Choose oos when none of the others fits.
         - name: commonsense
           task: multiple_choice
           data: {path: tau/commonsense_qa, split: train, columns: {answer: answerKey}}
           instructions: Choose the answer that makes the most sense.
+        # --- an ordered score
         - name: stars
           task: rating
           data: {path: Yelp/yelp_review_full, split: train, streaming: true, shuffle: true,
@@ -84,82 +121,120 @@ stages:
           levels: [very negative, negative, mixed, positive, very positive]
           instructions: How does the reviewer rate the business?
 
-  # 2. Format alignment: the model learns to put its answer at the slot. Short inputs, large
-  #    batches, a high learning rate.
-  - name: align
-    kind: decision.train
-    params:
-      init_from: "${vars.base_model}"
-      max_length: 1024
-      augment: {shuffle_options: true}
-      train: {learning_rate: 2.0e-4, num_train_epochs: 1, per_device_train_batch_size: 32,
-              eval_steps: 500, group_by_length: true}
-    gate: {metric: eval/accuracy, min: 0.6}
+        # --- held out: never trained on
+        - name: paraphrase
+          role: heldout
+          task: binary
+          data: {path: google-research-datasets/paws-x, name: en, split: validation}
+          state_columns: {first: sentence1, second: sentence2}
+          instructions: Do the two sentences mean the same thing?
+        - name: film_reviews
+          role: heldout
+          task: binary
+          data: {path: stanfordnlp/imdb, split: test, shuffle: true, max_samples: 2000}
+          instructions: Does the reviewer recommend the film?
+        - name: science_entailment
+          role: heldout
+          task: classification
+          data: {path: allenai/scitail, name: tsv_format, split: validation}
+          state_columns: {premise: premise, hypothesis: hypothesis}
+          instructions: Does the premise support the hypothesis?
 
-  # 3. The full mixture on long inputs, three times, each with its own seed and data mixture.
-  #    Every prompt variation is on: option order, option format, state format, missing descriptions.
-  - &member
-    name: full-s1
-    kind: decision.train
-    params: &member_params
-      init_from: "${align.model}"
-      seed: 1
-      max_length: 8192
-      augment: {shuffle_options: true, description_dropout: 0.15, mix_option_format: true, mix_state_format: true}
-      train: {learning_rate: 5.0e-5, num_train_epochs: 2, per_device_train_batch_size: 8,
-              gradient_accumulation_steps: 4, eval_steps: 500, group_by_length: true,
-              gradient_checkpointing: true}
-    gate: {metric: eval/accuracy, baseline: align.eval/accuracy, max_drop: 0.01}
-  - <<: *member
-    name: full-s2
+  # 2. The untrained model on the held-out records, in the same prompt: what training has to beat.
+  - name: eval_base
+    kind: decision.eval
     params:
-      <<: *member_params
-      seed: 2
-      mixture: {nli: 2.0, boolq: 2.0, topic: 0.5}     # more reading, less topic
-  - <<: *member
-    name: full-s3
-    params:
-      <<: *member_params
-      seed: 3
-      mixture: {intent: 2.0, commonsense: 2.0, toxicity: 0.5}   # more many-option questions
+      model: ${vars.base_model}
+      data: ${data.heldout_eval}
+      prompt: *prompt
+      max_length: 4096
+      blind_probe: false
 
-  # 4. One model from the three: a checkpoint joins only if the soup's held-out NLL does not get worse.
+  # 3. One run per seed, straight from the base model. LoRA on all linear layers; plain
+  #    cross-entropy over the options with no label smoothing; the checkpoint with the lowest
+  #    held-out NLL, not the highest accuracy. Every prompt variation is on.
+  - name: train
+    kind: decision.train
+    matrix:
+      seed: [1, 2, 3]
+    params:
+      init_from: ${vars.base_model}
+      train_data: ${data.train}
+      eval_data: ${data.eval}
+      max_eval_samples: 2000
+      max_length: 4096
+      prompt: *prompt
+      lora: {r: 32, alpha: 64, target_modules: all-linear}
+      loss: {label_smoothing: 0.0, ordinal_sigma: 0.5, vocab_mass_weight: 0.1}
+      augment:
+        shuffle_options: true
+        description_dropout: 0.15
+        mix_option_format: true
+        mix_state_format: true
+        subsample_options: 0.2
+        none_of_the_above: 0.1
+        derive_noul: 0.1
+      train:
+        learning_rate: 1.0e-4
+        num_train_epochs: 1
+        per_device_train_batch_size: 8
+        gradient_accumulation_steps: 4
+        eval_steps: 500
+        load_best_model_at_end: true
+        metric_for_best_model: eval_nll
+        greater_is_better: false
+        group_by_length: true
+        gradient_checkpointing: true
+
+  # 4. One model from the three: a run joins only if the soup's NLL does not get worse, judged on
+  #    held-out rows of the training sources. Expect little from this step; it reduces variance.
   - name: soup
     kind: decision.soup
     params:
-      models: ["${full-s1.model}", "${full-s2.model}", "${full-s3.model}"]
+      group: train
       method: greedy
-      data: "${data.calibration}"
+      data: ${data.calibration}
       metric: nll
       max_samples: 2000
 
-  # 5. One temperature per question type, on the calibration split. No stage trains on it; the
-  #    soup picks its members on it. The eval split is touched by neither.
+  # 5. Temperatures per question type and option-count band, fitted on sources the model has
+  #    never seen and on rows the soup was not chosen on.
   - name: calibrate
     kind: decision.calibrate
     params:
-      model: "${soup.model}"
-      data: "${data.calibration}"
+      model: ${soup.model}
+      data: ${data.heldout_calibration}
 
-  # 6. The held-out report, with the two shortcut probes.
-  - name: eval
+  # 6. The number that counts: unseen sources, question by question against the base model.
+  - name: eval_heldout
     kind: decision.eval
     params:
-      model: "${soup.model}"
-      data: "${data.eval}"
-      calibration: "${calibrate.calibration}"
+      model: ${soup.model}
+      data: ${data.heldout_eval}
+      calibration: ${calibrate.calibration}
+      compare_to: ${eval_base.predictions}
       blind_probe: true
       permutations: 3
     gate:
-      - {metric: eval/accuracy, baseline: align.eval/accuracy, max_drop: 0.0}
-      - {metric: eval/ece, max: 0.05}
+      - {metric: eval/delta_accuracy_ci_low, min: 0.0}       # better than the base model, beyond chance
+      - {metric: eval/confident_errors, max: 0.05}           # wrong answers given 90 % or more
       - {metric: eval/permutation_consistency, min: 0.9}
       - {metric: eval/blind_gap, min: 0.1}
+
+  # The training sources' own held-out rows, reported apart: this number flatters the model.
+  - name: eval_seen
+    kind: decision.eval
+    params:
+      model: ${soup.model}
+      data: ${data.eval}
+      calibration: ${calibrate.calibration}
+      blind_probe: false
 
   # 7. The final directory: weights, tokenizer, prompt style and calibration in decision.json.
   - name: export
     kind: decision.export
+    needs: [eval_heldout]
     params:
-      model: "${soup.model}"
-      calibration: "${calibrate.calibration}"
+      model: ${soup.model}
+      calibration: ${calibrate.calibration}
       precision: bf16

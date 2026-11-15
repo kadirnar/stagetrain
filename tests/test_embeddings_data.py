@@ -1,8 +1,10 @@
+import math
 from pathlib import Path
 
 import pytest
 
 from stagetrain.core import Pipeline, load_config
+from stagetrain.tracks.embeddings.bm25 import BM25, tokenize
 from stagetrain.tracks.embeddings.data import (
     build_eval_set,
     clean_pairs,
@@ -11,9 +13,18 @@ from stagetrain.tracks.embeddings.data import (
     split_by_query,
     write_eval_set,
 )
+from stagetrain.tracks.embeddings.merge import MergeParams, member_weights
 from stagetrain.tracks.embeddings.mine import MineParams, score_stats
 from stagetrain.tracks.embeddings.model import PromptSpec
-from stagetrain.tracks.embeddings.train import LossSpec, order_columns, trim_scores
+from stagetrain.tracks.embeddings.ranking import (
+    bootstrap_mean,
+    mrr_at_k,
+    ndcg_at_k,
+    paired_difference,
+    recall_at_k,
+    summarize_rankings,
+)
+from stagetrain.tracks.embeddings.train import LossSpec, normalize_scores, order_columns, trim_scores
 
 CONFIGS = sorted((Path(__file__).parent.parent / "configs" / "embeddings").glob("*.yaml"))
 
@@ -95,17 +106,107 @@ def test_specs():
     assert PromptSpec(query="q: ").for_columns(["query", "positive"]) == {"query": "q: "}
     assert LossSpec(distill_weight=0.5).needs_scores and LossSpec(name="margin_mse").needs_scores
     assert not LossSpec(name="cached_mnrl").needs_scores
-    with pytest.raises(ValueError, match="combines with `mnrl` only"):
+    # which distillation loss is in use: alone by name, or as a term next to a contrastive loss
+    assert LossSpec().distillation is None and LossSpec(name="kl_div").distillation == "kl_div"
+    assert LossSpec(distill_weight=1.0).distillation == "kl_div"  # listwise by default
+    assert LossSpec(distill_weight=1.0, distill_loss="margin_mse").distillation == "margin_mse"
+    assert LossSpec(name="gist", guide="g", distill_weight=1.0).needs_scores
+    assert LossSpec().scale == 50.0  # a temperature of 0.02
+    with pytest.raises(ValueError, match="combines with `mnrl` or `gist` only"):
         LossSpec(name="cached_mnrl", distill_weight=0.5)
+    with pytest.raises(ValueError, match="needs a guide model"):
+        LossSpec(name="cached_gist")
     with pytest.raises(ValueError, match="must match matryoshka_dims"):
         LossSpec(matryoshka_dims=[32, 16], matryoshka_weights=[1.0])
     with pytest.raises(ValueError, match="smaller than num_negatives"):
         MineParams(model="m", train_data="t", num_negatives=8, range_min=10, range_max=15)
+    # the positive-aware filter alone: no ranks are skipped after it
+    default = MineParams(model="m", train_data="t")
+    assert (default.range_min, default.relative_margin, default.teacher_scores) == (0, 0.05, "probability")
+    with pytest.raises(ValueError, match="removes every candidate"):
+        MineParams(model="m", train_data="t", cross_encoder="teacher", absolute_margin=1.0)
+    with pytest.raises(ValueError, match="max_score must be above 0"):
+        MineParams(model="m", train_data="t", cross_encoder="teacher", max_score=0.0)
+    assert MineParams(model="m", train_data="t", absolute_margin=1.0).absolute_margin == 1.0  # no teacher: the miner's own scale
     stats = score_stats([[0.9, 0.5, 0.3], [0.7, 0.6, 0.2]])
     assert stats["mine/positive_score"] == pytest.approx(0.8)
     assert stats["mine/negative_score"] == pytest.approx(0.4)
     assert stats["mine/margin"] == pytest.approx(0.4) and stats["mine/min_margin"] == pytest.approx(0.1)
     assert score_stats([]) == {}
+
+
+def test_teacher_scores_are_normalised_per_query():
+    assert normalize_scores({"scores": [8.0, 2.0, -4.0]}) == {"scores": [1.0, 0.5, 0.0]}  # logits
+    assert normalize_scores({"scores": [0.9, 0.6, 0.3]})["scores"] == pytest.approx([1.0, 0.5, 0.0])  # probabilities: the same
+    assert normalize_scores({"scores": [0.4, 0.4]}) == {"scores": [0.5, 0.5]}  # no preference, no division by zero
+
+
+def test_per_query_metrics():
+    relevant = {"d1", "d2"}
+    assert ndcg_at_k(["d1", "d2", "x"], relevant) == pytest.approx(1.0)
+    assert ndcg_at_k(["x", "d1"], {"d1"}) == pytest.approx(1 / math.log2(3))
+    assert ndcg_at_k(["x", "y"], relevant) == 0.0 and ndcg_at_k(["d1"], set()) == 0.0
+    assert ndcg_at_k(["x"] * 10 + ["d1"], {"d1"}) == 0.0  # found, but past the cutoff
+    assert mrr_at_k(["x", "y", "d2"], relevant) == pytest.approx(1 / 3) and mrr_at_k(["x"], relevant) == 0.0
+    assert recall_at_k(["d1", "x", "d2"], relevant, 1) == 0.5 and recall_at_k(["d1", "x", "d2"], relevant, 3) == 1.0
+    metrics, per_query = summarize_rankings(
+        {"q1": ["d1", "x"], "q2": ["x", "d9"]}, {"q1": {"d1"}, "q2": {"d9"}, "q3": {"d5"}}, recall_at=[1, 10]
+    )
+    assert per_query == {"q1": 1.0, "q2": pytest.approx(1 / math.log2(3)), "q3": 0.0}  # a query with no ranking scores 0
+    assert metrics["ndcg@10"] == pytest.approx((1 + 1 / math.log2(3)) / 3)
+    assert metrics["accuracy@1"] == pytest.approx(1 / 3) and metrics["recall@10"] == pytest.approx(2 / 3)
+    assert metrics["mrr@10"] == pytest.approx(0.5)
+
+
+def test_bootstrap_interval_and_paired_difference():
+    stats = bootstrap_mean([1.0] * 70 + [0.0] * 30)
+    assert stats["mean"] == 0.7 and 0.59 < stats["ci_low"] < 0.65 and 0.75 < stats["ci_high"] < 0.81
+    assert bootstrap_mean([]) == {"n": 0.0} and bootstrap_mean([0.4])["ci_low"] == 0.4
+    assert bootstrap_mean([1.0] * 70 + [0.0] * 30) == stats  # seeded: the same interval every time
+
+    base = {f"q{i}": float(i % 10 < 6) for i in range(300)}
+    tuned = {q: 1.0 if i % 10 == 6 else base[q] for i, q in enumerate(base)}  # the same answers plus one more in ten
+    diff = paired_difference(tuned, base)
+    assert diff["delta"] == pytest.approx(0.1) and diff["wins"] == 30 and diff["losses"] == 0
+    assert diff["ci_low"] > 0  # better beyond chance...
+    separate = bootstrap_mean(list(tuned.values()))["ci_low"] - bootstrap_mean(list(base.values()))["ci_high"]
+    assert separate < 0  # ...which two unpaired intervals of this size cannot show
+    assert paired_difference({"a": 1.0}, {"b": 1.0}) == {"n": 0.0}
+    assert paired_difference({"a": 1.0, "x": 0.0}, {"a": 0.0, "y": 1.0})["n"] == 1
+
+
+def test_bm25_ranks_by_rare_shared_words():
+    pytest.importorskip("numpy")
+    corpus = {
+        "d1": "The capital of France is Paris.",
+        "d2": "Berlin is the capital of Germany.",
+        "d3": "Paris Paris Paris: a film about the city of Paris.",
+        "d4": "The stock market fell today.",
+    }
+    index = BM25(corpus)
+    assert tokenize("The Capital, of FRANCE!") == ["the", "capital", "of", "france"]
+    assert index.search("capital of france")[0] == "d1"
+    assert index.search("capital of germany")[0] == "d2"
+    assert set(index.search("paris")) == {"d1", "d3"}  # only documents that share a word are returned
+    assert index.search("quantum chromodynamics") == []
+    assert len(index.search("the", k=2)) == 2 and len(index.search("the")) == 4  # k cuts the list, nothing else
+    assert BM25({}).search("anything") == []
+    # length normalisation: with b = 0 the document repeating the word wins outright
+    assert BM25(corpus, b=0.0).search("paris")[0] == "d3"
+
+
+def test_merge_weights():
+    assert member_weights(2, None, False, 0.5) == ([0.5, 0.5], 0.0)  # no base: the share is ignored
+    weights, base = member_weights(2, [3.0, 1.0], True, 0.2)
+    assert weights == pytest.approx([0.6, 0.2]) and base == 0.2 and sum(weights) + base == pytest.approx(1.0)
+    assert member_weights(1, None, True, 0.0) == ([1.0], 0.0)
+    with pytest.raises(ValueError, match="needs `models` or a `group`"):
+        MergeParams()
+    with pytest.raises(ValueError, match="weights must match"):
+        MergeParams(models=["a", "b"], weights=[1.0])
+    with pytest.raises(ValueError, match="weights must match"):
+        MergeParams(group="finetune", weights=[1.0])
+    assert MergeParams(group="finetune", base="b").base_weight == 0.5
 
 
 def test_track_imports_without_training_libraries():
@@ -120,8 +221,8 @@ def test_track_imports_without_training_libraries():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
     assert out.strip() == str([
-        "embeddings.eval", "embeddings.export", "embeddings.finetune", "embeddings.mine_negatives",
-        "embeddings.prepare_data", "embeddings.pretrain",
+        "embeddings.bm25", "embeddings.eval", "embeddings.export", "embeddings.finetune", "embeddings.merge",
+        "embeddings.mine_negatives", "embeddings.prepare_data", "embeddings.pretrain", "embeddings.select",
     ])
 
 

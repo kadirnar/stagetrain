@@ -1,37 +1,103 @@
 # llm track: multi-stage fine-tuning with Unsloth
 
-A causal language model is adapted in stages, each one a registered stage kind that starts from a
-base model or from the `model` artifact of an earlier stage:
+The track trains a causal language model in stages, with the goal of the highest task accuracy.
+Which stages exist, their order and their defaults follow [docs/research/llm.md](research/llm.md):
+measure first, sweep the learning rate, choose the checkpoint by the task metric, add verified
+data, then post-train with preference optimisation or reinforcement learning.
 
 ```
-prepare_data ─┬─> cpt ──> sft (broad) ──> sft (domain) ──> dpo ──> eval ──> export
-              └─> eval (base model: the bar the gates compare against)
+prepare_data ─┬─> eval (base) ──> eval (prompt-only)
+              └─> sft x N (matrix) ──> select ──> select_checkpoint ──> eval
+                                                        └──> generate_data ─┬─> dpo ─┐
+                                                                            └────────┴─> grpo ──> eval ──> export
 ```
 
-Any stage can be left out, and `llm.sft` can appear as many times as needed. Two example
-pipelines ship in `configs/llm/`: `qwen3-multistage.yaml` (every stage, with gates) and
-`sft-only.yaml` (the shortest useful one).
+Every stage starts from a base model or from the `model` artifact of an earlier stage, so stages
+can be left out, repeated and reordered. Example pipelines in `configs/llm/`:
+
+| Config | What it is |
+|---|---|
+| `accuracy.yaml` | The research-driven recipe on a task with checkable answers: baselines, a learning-rate sweep, checkpoint selection, self-play, GRPO, paired evaluations |
+| `qwen3-multistage.yaml` | Continued pretraining, two SFT passes, DPO, export |
+| `sft-only.yaml` | The shortest useful pipeline |
 
 ## Stages
 
-| Kind | What it does | Why it is a stage of its own | Reads | Writes (artifacts) | Typical gate |
-|---|---|---|---|---|---|
-| `llm.prepare_data` | Normalises chat sources (`messages`, `sharegpt`, `alpaca`, `prompt_completion`), raw text and preference pairs; drops invalid rows and duplicates; filters by length; splits train/eval by content hash. | Every later stage reads the same clean files, and the held-out rows stay held out for all of them. No model is loaded. | `DataSource`s | `chat_train`, `chat_eval`, `text_train`, `text_eval`, `preference_train`, `preference_eval`, `stats` | `chat/train_rows` min |
-| `llm.cpt` | Continued pretraining on raw text. LoRA (rank 128, rsLoRA) plus fully trained `embed_tokens` and `lm_head`, which get their own, 10x lower learning rate. | Domain vocabulary and facts come from unlabelled text, before any instruction data is spent. | `text_train` | `model` (adapter), `log` | `eval/loss` max |
-| `llm.sft` | Chat fine-tuning. Conversations are rendered with the tokenizer's chat template; the loss covers assistant turns only (`train_on_responses_only`). | Broad instruction data first, then the small curated domain set at a lower learning rate, so the second cannot be drowned by the first. | `chat_train`, an earlier `model` | `model`, `log`, `base` (when merged) | `eval/loss` not above the base model's |
-| `llm.dpo` | Direct preference optimisation on prompt / chosen / rejected (TRL `DPOTrainer`). | Preferences (tone, refusals, format) are learnt after the model already answers correctly. | `preference_train`, an earlier `model` | `model`, `log`, `base` | `eval/loss` max |
-| `llm.eval` | Held-out loss and perplexity with the same masking as `llm.sft`, plus greedy generations compared with the references (`eval/exact_match`, `eval/contains`). Run it on the base model too. | Gates need a number measured the same way for every model in the chain. | `chat_eval`, a `model` | `samples`, `report` | relative to `eval_base` and to the previous stage |
-| `llm.export` | Saves `lora`, `merged_16bit`, `merged_4bit` and/or `gguf` (any llama.cpp quantisation). Pushes to the Hub only when `push_to_hub` names a repository; repositories are private unless `private: false`. | Export is slow and large; it should run once, after the gates passed. | a `model` | one artifact per format, `model` | - |
+| Kind | What it does | Why it is there |
+|---|---|---|
+| `llm.prepare_data` | Normalises chat, raw-text and preference sources; drops invalid rows and duplicates; splits by question into train, validation (`eval`) and optionally test; mixes in general data (`replay_ratio`) | Two rows asking the same thing never sit on both sides of a split. Validation is selected on; test is only reported |
+| `llm.eval` | Generates answers and scores them with a task scorer; reports the mean with its standard error and 95 % interval; compares with another evaluation item by item (`compare_to`); optional few-shot and system-prompt baselines; optional held-out loss | A loss cannot rank models across recipes, and an unpaired comparison needs thousands of rows to see three points |
+| `llm.cpt` | Continued pretraining on raw text, with the embeddings and output head trained at a lower learning rate | For domains whose vocabulary the base model lacks. Not in the accuracy recipe: raw-text pretraining tends to damage prompting |
+| `llm.sft` | Chat fine-tuning through the tokenizer's chat template, loss on assistant turns only, a checkpoint per epoch | The main stage. Run it as a `matrix` over the learning rate |
+| `llm.select` | The best run of a matrix by one metric; hands on that run's artifacts | The learning rate is the most sensitive setting |
+| `llm.select_checkpoint` | Answers the validation questions with every checkpoint of a training stage and keeps the best (or, with `tolerance`, the earliest one close to the best) | Validation loss bottoms out early while answers keep improving. Before RL, a less-trained checkpoint explores more |
+| `llm.generate_data` | A model answers training prompts several times without seeing the references; a scorer sorts the answers | Verified answers to train on (from a teacher or the model itself), right/wrong pairs for DPO, and the share of prompts RL can still learn from |
+| `llm.dpo` | Direct preference optimisation on prompt / chosen / rejected | Helps at about 7B and above in the available evidence; not below |
+| `llm.grpo` | Reinforcement learning with verifiable rewards (TRL's `GRPOTrainer`): DAPO by default, also Dr. GRPO, BNPO, GRPO, CISPO, and GSPO through `importance_sampling_level: sequence` | A few points on top of SFT when answers can be checked and the model already solves part of the prompts |
+| `llm.export` | LoRA adapter, merged 16-bit or 4-bit checkpoint, GGUF; optional Hub push, private by default | Runs once, after the gates |
 
-Metrics follow one naming scheme (`train/loss`, `eval/loss`, `eval/perplexity`, `eval/exact_match`,
-`chat/train_rows`, ...), so a gate can name any of them, alone (`min`, `max`) or against an earlier
-stage (`baseline: eval_base.eval/loss`, `max_rise: 0.0`).
+### Scorers
+
+One scorer definition is used by `llm.eval`, `llm.select_checkpoint`, `llm.generate_data` and the
+`correct` reward of `llm.grpo`, so "correct" means the same thing everywhere.
+
+| `scorer.name` | Correct when |
+|---|---|
+| `exact` | the answer equals the reference, case and whitespace aside |
+| `contains` | the reference appears in the answer |
+| `numeric` | the last number in the answer equals the last number in the reference |
+| `choice` | the option letter the answer settles on equals the reference's |
+| `regex` | `pattern`'s first group in the answer equals the reference |
+| `json` | the answer parses as JSON and equals the reference, on `fields` if given |
+| `custom` | `function: "package.module:name"`, called as `f(output, reference, row)`, returns 0 to 1 |
+
+By default a reasoning block (`<think>...</think>`) is removed before scoring. `eval/no_answer`
+is the share of answers that are empty once it is removed, which is what a generation that ran
+out of tokens inside its reasoning looks like.
+
+### Rewards for `llm.grpo`
+
+```yaml
+rewards:
+  - {kind: correct, scorer: {name: numeric}, weight: 1.0}
+  - {kind: format, pattern: '####\s*-?[\d,.]+\s*$', weight: 0.1}
+```
+
+Kinds: `correct` (a scorer), `format` (the answer matches a pattern), `reasoning` (a closed,
+non-empty reasoning block followed by an answer), `length` (a penalty past `max_chars`), `custom`.
+Each term is logged on its own (`train/rewards/<name>/mean`); the weights combine them. Keep
+`correct` dominant: the other terms can be collected without solving anything.
+
+The stage reports `train/reward_start`, `train/reward` and `train/reward_gain` (the mean reward
+over the first and last tenth of the run), so a gate can require that the run learned. The
+held-out reward is measured afterwards by `llm.eval`, which decodes greedily; TRL's own
+evaluation samples at the training temperature.
+
+### What a gate can say
+
+```yaml
+gate:
+  - {metric: eval/delta_ci_low, min: 0.0}            # better than the compared model, beyond chance
+  - {metric: eval/score, baseline: eval_sft.eval/score, max_drop: 0.0}
+  - {metric: generate/mixed_fraction, min: 0.1}       # RL has something to learn from
+  - {metric: train/reward_gain, min: 0.0}
+  - {metric: eval/no_answer, max: 0.05}
+  - {metric: eval/valid_reasoning, min: 0.95}         # with expect_reasoning: true
+```
+
+### Reasoning models
+
+Pass the template's switch wherever prompts are rendered, with the same value in every stage:
+`chat_template_kwargs: {enable_thinking: false}`. To keep a model's reasoning ability, train on
+answers that contain reasoning (`llm.generate_data` with `require_reasoning: true` produces them)
+and evaluate with `expect_reasoning: true`. `mask_out_tokens` on `llm.sft` is passed to Unsloth's
+`train_on_responses_only`.
 
 ## How stages chain
 
 `init_from` is a Hub id or `${stage.model}`. When it is a LoRA adapter, `on_adapter` decides:
 
-- `continue` (default for `cpt` and `sft`): the adapter is loaded on its base model and trained
+- `continue` (default for `cpt`, `sft` and `grpo`): the adapter is loaded on its base model and trained
   further. This is what Unsloth documents for resuming from a saved adapter. The adapter keeps
   the shape the earlier stage gave it, so this stage's `lora` block is not used. If the adapter
   carries trained embeddings (it came from `llm.cpt`), they keep training, at a tenth of the
@@ -72,33 +138,46 @@ Train in an environment of its own: `unsloth 2026.11.4` pins `transformers<=5.17
 ```bash
 pip install -e ".[llm]"                                   # on the GPU machine
 stagetrain kinds llm --params                              # every stage and parameter
-stagetrain plan configs/llm/qwen3-multistage.yaml          # validate, show what would run
-stagetrain run  configs/llm/qwen3-multistage.yaml          # run; rerun to resume
-stagetrain run  configs/llm/qwen3-multistage.yaml --from sft_domain \
-    --set sft_domain.train.learning_rate=5e-5              # change one stage, rerun from it
-stagetrain status configs/llm/qwen3-multistage.yaml        # states and metrics
+stagetrain plan   configs/llm/accuracy.yaml                # validate, show what would run
+stagetrain run    configs/llm/accuracy.yaml                # run; rerun to resume
+stagetrain report configs/llm/accuracy.yaml --open         # stages, gates, metrics, training curves
+stagetrain run    configs/llm/accuracy.yaml --from grpo --set grpo.loss_type=dr_grpo
 ```
+
+`report.html` is rewritten after every stage, and a training stage appends to its
+`history.jsonl` as it logs, so `stagetrain report` can be run while a stage is still training.
+For live dashboards set `train: {report_to: [trackio]}` (or `wandb`, `tensorboard`).
+
+Not supported: multi-GPU. Unsloth trains with DDP under `torchrun`, but this pipeline is one
+process; under `torchrun` every rank would run every stage.
 
 ## Code layout
 
 - `data.py`: row normalisation, chunking, the content-hash split. No model or tokenizer.
+- `scoring.py`: scorers, reasoning-block handling, standard errors, paired differences.
+- `rewards.py`: reward terms as the functions TRL's `GRPOTrainer` calls.
 - `backend.py`: every Unsloth / TRL call, in `UnslothBackend`, and the plain functions that turn
   stage parameters into library keyword arguments. Stages only talk to `get_backend()`, so tests
   swap in a fake with `set_backend`.
-- `prepare.py`, `train.py`, `evaluate.py`, `export.py`: the stages.
+- `prepare.py`, `train.py`, `evaluate.py`, `select.py`, `generate.py`, `export.py`: the stages.
 
 ## What was verified, and how
 
 Nothing in this track was run against a model: it was written on a machine without a CUDA device,
 and no weights were downloaded.
 
-Run here (47 tests, `pytest tests/test_llm_*.py`):
+Run here (`pytest tests/test_llm_*.py`):
 
-- data normalisation, rejection reasons, chunking, the split's stability;
-- parameters -> keyword arguments, and that `sft_config_kwargs` / `dpo_config_kwargs` build real
-  `trl.SFTConfig` / `trl.DPOConfig` objects on the installed trl 1.18 / transformers 5.23;
-- the stages through `Pipeline` with a fake backend: artifacts, metrics, `continue` vs `merge`,
-  full fine-tuning, resume/skip, gates, export order, and that both shipped configs validate.
+- data normalisation, rejection reasons, chunking, the splits and replay mixing;
+- every scorer, the standard error and the paired difference, the reward terms called the way
+  TRL calls them;
+- parameters -> keyword arguments, and that `sft_config_kwargs`, `dpo_config_kwargs` and
+  `grpo_config_kwargs` build real `trl.SFTConfig`, `trl.DPOConfig` and `trl.GRPOConfig` objects
+  on the installed trl 1.18 / transformers 5.23;
+- the stages through `Pipeline` with a fake backend: the whole accuracy pipeline (baselines,
+  sweep, selection, checkpoint choice, self-play, DPO, GRPO, paired final evaluation and its
+  gate), `continue` vs `merge`, full fine-tuning, resume/skip, export order, and that every
+  shipped config validates.
 
 Verified by reading the source of `unsloth 2026.11.4` and `unsloth_zoo 2026.11.4` only, never by
 running it:
@@ -128,3 +207,12 @@ Not verified at all, to check on the first real run:
   untouched.
 - `on_adapter: continue` for `llm.dpo` relies on TRL keeping a frozen copy of the starting adapter
   as the reference; `merge` (the default) does not depend on it.
+- `GRPOConfig` field names are the same in trl 1.15 and 1.18 according to a diff of the two
+  releases; the stage was checked against 1.18 only.
+- `llm.grpo`: the reward functions were called in tests the way TRL's documentation and source
+  describe (`prompts`, `completions`, extra dataset columns as keyword arguments). No GRPO step
+  was run. `fast_inference` (vLLM) was not exercised at all.
+- `backend.sample` generates several answers with `num_return_sequences` on one prompt at a
+  time. It is correct by construction but slow; batching it is the first optimisation to make.
+- Loading a `checkpoint-<step>` directory as an adapter (`llm.select_checkpoint`) relies on a
+  Trainer checkpoint of a PEFT model holding `adapter_config.json` and the adapter weights.

@@ -193,9 +193,15 @@ def source_rows(src: DataSource) -> Iterable[dict[str, Any]]:
 class PrepareDataParams(StageParams):
     sources: list[DataSource]  # columns: query, positive, optionally negative
     eval_sources: list[DataSource] = Field(default_factory=list)  # a ready dev split; replaces eval_fraction
+    test_sources: list[DataSource] = Field(default_factory=list)  # a ready test split; replaces test_fraction
     corpus_sources: list[DataSource] = Field(default_factory=list)  # extra documents, column `text`
+    # Validation queries: checkpoints, sweeps and settings are chosen on them.
     eval_fraction: float = Field(default=0.0, ge=0.0, lt=1.0)
-    max_eval_queries: int | None = 2000
+    # Test queries: nothing is chosen on them, so the number reported on them is not flattered by
+    # the choosing. Without a test split, the best of several runs is reported on the queries
+    # that made it the best.
+    test_fraction: float = Field(default=0.0, ge=0.0, lt=1.0)
+    max_eval_queries: int | None = 2000  # per held-out split
     max_eval_distractors: int | None = 100_000  # training documents added to the eval corpus
     min_chars: int = 1
     max_chars: int | None = None
@@ -205,7 +211,7 @@ class PrepareDataParams(StageParams):
 
 @register("embeddings.prepare_data")
 class PrepareData(Stage):
-    """Clean and deduplicate (query, positive[, negative]) pairs, split off eval queries, build a retrieval eval set."""
+    """Clean and deduplicate (query, positive[, negative]) pairs; split off validation and test queries; build their eval sets."""
 
     Params = PrepareDataParams
 
@@ -219,15 +225,30 @@ class PrepareData(Stage):
         if not rows:
             raise ValueError(f"no usable pairs in the sources; {stats}")
 
-        if p.eval_sources:
-            held, _ = clean_pairs((r for s in p.eval_sources for r in source_rows(s)), **clean)
-            eval_queries = {text_key(r["query"]) for r in held}
-            train = [r for r in rows if text_key(r["query"]) not in eval_queries]
-            stats["dropped_leaked"] = len(rows) - len(train)  # training pairs whose query is an eval query
-            if p.max_eval_queries is not None:
-                _, held = split_by_query(held, 1.0, self.seed(ctx), p.max_eval_queries)
-        else:
-            train, held = split_by_query(rows, p.eval_fraction, self.seed(ctx), p.max_eval_queries)
+        seed = self.seed(ctx)
+        train = rows
+        splits: dict[str, list[dict[str, str]]] = {}
+        held_out: set[str] = set()  # queries already given to a held-out split
+        stats["dropped_leaked"] = 0
+        # Test first, then validation out of what is left: a query sits in exactly one of the three.
+        for name, ready, fraction, split_seed in (
+            ("test", p.test_sources, p.test_fraction, seed + 1), ("eval", p.eval_sources, p.eval_fraction, seed),
+        ):
+            if ready:
+                part, _ = clean_pairs((r for s in ready for r in source_rows(s)), **clean)
+                part = [r for r in part if text_key(r["query"]) not in held_out]
+                keys = {text_key(r["query"]) for r in part}
+                kept = [r for r in train if text_key(r["query"]) not in keys]
+                stats["dropped_leaked"] += len(train) - len(kept)  # training pairs whose query is held out
+                train = kept
+                if p.max_eval_queries is not None:
+                    _, part = split_by_query(part, 1.0, split_seed, p.max_eval_queries)
+            else:
+                train, part = split_by_query(train, fraction, split_seed, p.max_eval_queries)
+                keys = {text_key(r["query"]) for r in part}
+            held_out |= keys
+            splits[name] = part
+        held, test = splits["eval"], splits["test"]
         if not train:
             raise ValueError("the split left no training pairs")
 
@@ -263,13 +284,22 @@ class PrepareData(Stage):
             "data/eval_pairs": len(held),
             **{f"data/{k}": v for k, v in stats.items()},
         }
-        if held:
-            queries, eval_corpus, qrels = build_eval_set(held, corpus, p.max_eval_distractors)
-            artifacts["eval_pairs"] = ctx.path("eval_pairs.jsonl")
-            write_jsonl(artifacts["eval_pairs"], ({"query": r["query"], "positive": r["positive"]} for r in held))
-            artifacts["eval_set"] = write_eval_set(ctx.path("eval_set", "queries.jsonl").parent, queries, eval_corpus, qrels)
-            metrics["data/eval_queries"] = len(queries)
-            metrics["data/eval_corpus"] = len(eval_corpus)
+        for name, part in (("eval", held), ("test", test)):
+            if not part:
+                continue
+            queries, part_corpus, qrels = build_eval_set(part, corpus, p.max_eval_distractors)
+            artifacts[f"{name}_pairs"] = ctx.path(f"{name}_pairs.jsonl")
+            write_jsonl(artifacts[f"{name}_pairs"], ({"query": r["query"], "positive": r["positive"]} for r in part))
+            artifacts[f"{name}_set"] = write_eval_set(
+                ctx.path(f"{name}_set", "queries.jsonl").parent, queries, part_corpus, qrels
+            )
+            metrics[f"data/{name}_queries"] = len(queries)
+            metrics[f"data/{name}_corpus"] = len(part_corpus)
+        if test:
+            metrics["data/test_pairs"] = len(test)
         artifacts["stats"] = write_json(ctx.path("stats.json"), metrics)
-        ctx.log.info("prepare_data: %d train pairs, %d eval pairs, %d corpus documents", len(train), len(held), len(corpus))
+        ctx.log.info(
+            "prepare_data: %d train pairs, %d eval pairs, %d test pairs, %d corpus documents",
+            len(train), len(held), len(test), len(corpus),
+        )
         return StageResult(artifacts=artifacts, metrics=metrics)

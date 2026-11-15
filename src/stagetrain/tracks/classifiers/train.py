@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import shutil
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from stagetrain.core import (
     Stage,
@@ -19,9 +20,11 @@ from stagetrain.core import (
     read_jsonl,
     register,
     seed_everything,
+    write_jsonl,
 )
+from stagetrain.core.history import history_callback, save_history
 
-from .labels import LABELS_FILE, LabelSpace, source_counts
+from .labels import LABELS_FILE, LabelSpace, source_counts, text_key
 
 
 def _paths(v: Any) -> Any:
@@ -67,7 +70,10 @@ class MlmParams(StageParams):
     max_length: int = 256
     chunk_long_texts: bool = True  # split texts longer than max_length into windows instead of truncating
     stride: int = 32
-    mlm_probability: float = 0.15  # ModernBERT was pretrained with 0.3
+    # 0.15 is the rate to start from when the goal is classification. ModernBERT was pretrained
+    # at 0.3, but the two newest pretraining studies find classification falls as the rate rises.
+    # Losses at different rates are not comparable: decide by the downstream metric.
+    mlm_probability: float = 0.15
     max_samples: int | None = None
     train: TrainArgs = Field(default_factory=lambda: TrainArgs(learning_rate=5e-5, num_train_epochs=3))
     resume: bool = True  # continue from the last checkpoint when the pipeline resumes this same run
@@ -145,7 +151,9 @@ class MlmAdapt(Stage):
         if has_eval:
             metrics["mlm/loss_before"] = float(trainer.evaluate()["eval_loss"])
         last = resume_point(checkpoints, p.resume and ctx.resumed)
+        trainer.add_callback(history_callback(ctx.out_dir))
         out = trainer.train(resume_from_checkpoint=last)
+        save_history(ctx.out_dir, trainer.state.log_history)
         metrics["train/loss"] = float(out.training_loss)
         if has_eval:
             loss = float(trainer.evaluate()["eval_loss"])
@@ -175,19 +183,35 @@ class ExtraData(BaseModel):
 
 
 class FinetuneParams(StageParams):
+    """Supervised fine-tuning. What decides the result, in this order: the learning rate, the
+    number of epochs, the encoder and its size, and the seed. Sweep the first three with a
+    `matrix` and judge each setting by its mean over at least three seeds; the defaults below
+    are a starting point for a ModernBERT-base-sized encoder, not a tuned recipe."""
+
     init_from: str  # a Hub id, or the `model` artifact of mlm_adapt or of an earlier finetune
     labels: str  # labels.json from prepare_data
     train_data: str
     eval_data: str | None = None
     extra_train_data: list[ExtraData] = Field(default_factory=list)
-    max_length: int = 256
 
-    loss: Literal["ce", "focal"] = "ce"  # for multi-label: BCE, or focal BCE
+    # `auto`: the length that fits `length_percentile` percent of the training rows, up to the
+    # model's limit (and `max_length_cap`, to bound the cost on long documents).
+    max_length: int | Literal["auto"] = "auto"
+    length_percentile: float = Field(default=99.0, gt=0.0, le=100.0)
+    max_length_cap: int | None = None
+    truncation: Literal["head", "head_tail"] = "head"  # head_tail: keep the start and the end of an over-long text
+    pooling: str | None = None  # `classifier_pooling` of ModernBERT-family models: mean or cls; None keeps the model's
+
+    # ce: plain cross-entropy (BCE for multi-label), the default the evidence supports.
+    # logit_adjusted: for single-label class imbalance, see `logit_adjustment_tau`.
+    loss: Literal["ce", "focal", "logit_adjusted"] = "ce"
     focal_gamma: float = 2.0
+    logit_adjustment_tau: float = Field(default=1.0, gt=0.0)  # strength of the prior correction
     class_weights: Literal["none", "balanced"] = "none"  # balanced: the weights prepare_data computed
-    label_smoothing: float = 0.0  # gold rows only; soft-labelled rows are used as they are
+    label_smoothing: float = 0.0  # gold rows only. Leave at 0 for a teacher whose confidence is thresholded or distilled
     soft_label_weight: float = 1.0  # loss weight of rows that carry `probs`
 
+    # Search dimensions, not defaults: none of these has controlled support on current encoders.
     llrd: float = 1.0  # layer-wise lr decay per layer from the top; 1.0 turns it off
     head_lr_multiplier: float = 1.0  # the classification head's lr relative to learning_rate
     adam_betas: tuple[float, float] = (0.9, 0.999)
@@ -196,7 +220,17 @@ class FinetuneParams(StageParams):
     head_warmup_lr: float = 1e-3
     classifier_dropout: float | None = None
 
-    train: TrainArgs = Field(default_factory=lambda: TrainArgs(learning_rate=3e-5, num_train_epochs=3))
+    # Stop when the eval metric has not improved for this many evaluations, and keep the best
+    # checkpoint. Evaluate several times per epoch (`train.eval_steps`) for this to be useful.
+    early_stopping_patience: int | None = Field(default=None, ge=1)
+
+    # Cross-validation: hold fold `fold` of `folds` out of the training rows (by a hash of the
+    # text), train on the rest, and write the held-out rows' predictions as the `oof` artifact.
+    # Run it as a matrix over `fold` and hand the runs to classifiers.audit_labels.
+    fold: int | None = Field(default=None, ge=0)
+    folds: int = Field(default=5, ge=2)
+
+    train: TrainArgs = Field(default_factory=lambda: TrainArgs(learning_rate=5e-5, num_train_epochs=3))
     resume: bool = True  # as in mlm_adapt
     keep_checkpoints: bool = False
     trust_remote_code: bool = False
@@ -205,6 +239,32 @@ class FinetuneParams(StageParams):
     @classmethod
     def _extra(cls, v: Any) -> Any:
         return [{"path": x} if isinstance(x, str) else x for x in (_paths(v) or [])]
+
+    @model_validator(mode="after")
+    def _consistent(self) -> FinetuneParams:
+        if self.early_stopping_patience and not self.eval_data:
+            raise ValueError("early_stopping_patience needs eval_data")
+        if self.fold is not None and self.fold >= self.folds:
+            raise ValueError(f"fold must be below folds ({self.folds}), got {self.fold}")
+        if self.loss == "logit_adjusted" and self.class_weights != "none":
+            raise ValueError("logit_adjusted already corrects for class frequency; use it without class_weights")
+        return self
+
+    def train_args(self) -> TrainArgs:
+        """`train`, with what early stopping needs: the best checkpoint kept, by macro-F1 unless
+        another metric is named."""
+        if not self.early_stopping_patience:
+            return self.train
+        update: dict[str, Any] = {"load_best_model_at_end": True}
+        if self.train.metric_for_best_model is None:
+            update.update(metric_for_best_model="eval_macro_f1", greater_is_better=True)
+        return self.train.model_copy(update=update)
+
+
+def fold_of(row: dict[str, Any], folds: int) -> int:
+    """Which fold a training row belongs to: decided by its text alone, so it is the same in
+    every run and for every seed."""
+    return int(hashlib.sha1(text_key(row).encode("utf-8")).hexdigest()[:8], 16) % folds
 
 
 def _keep_columns(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -256,11 +316,16 @@ class Finetune(Stage):
         from .modeling import (
             ClassifierTrainer,
             Collator,
+            auto_max_length,
             build_dataset,
             classification_loss,
             freeze_backbone,
             llrd_groups,
             load_classifier,
+            log_prior,
+            model_limit,
+            token_lengths,
+            write_preprocessing,
         )
 
         p: FinetuneParams = self.params
@@ -268,13 +333,32 @@ class Finetune(Stage):
         seed_everything(seed)
         labels = LabelSpace.load(p.labels)
         rows = read_rows(p.train_data, labels)
+        held_out: list[dict[str, Any]] = []
+        if p.fold is not None:
+            held_out = [r for r in rows if fold_of(r, p.folds) == p.fold]
+            rows = [r for r in rows if fold_of(r, p.folds) != p.fold]
+            if not rows or not held_out:
+                raise ValueError(f"fold {p.fold} of {p.folds} leaves {len(rows)} training and {len(held_out)} held-out rows")
         for extra in p.extra_train_data:
             rows += read_rows(extra.path, labels, extra.weight, extra.max_samples)
         eval_rows = read_rows(p.eval_data, labels) if p.eval_data else []
 
-        model, tokenizer = load_classifier(p.init_from, labels, p.trust_remote_code, p.classifier_dropout)
-        train_set = build_dataset(tokenizer, rows, labels, p.max_length, p.label_smoothing, p.soft_label_weight)
-        eval_set = build_dataset(tokenizer, eval_rows, labels, p.max_length)
+        model, tokenizer, model_notes = load_classifier(
+            p.init_from, labels, p.trust_remote_code, p.classifier_dropout, p.pooling
+        )
+        lengths = token_lengths(tokenizer, rows)
+        limit = min(model_limit(tokenizer, model.config), p.max_length_cap or 10**9)
+        max_length = auto_max_length(lengths, p.length_percentile, limit) if p.max_length == "auto" else p.max_length
+        truncated = sum(n > max_length for n in lengths) / len(lengths)
+        if truncated > 0.05:
+            ctx.log.warning(
+                "finetune: %.0f%% of the training rows are longer than max_length=%d and are cut (%s)",
+                100 * truncated, max_length, p.truncation,
+            )
+        train_set = build_dataset(
+            tokenizer, rows, labels, max_length, p.label_smoothing, p.soft_label_weight, p.truncation
+        )
+        eval_set = build_dataset(tokenizer, eval_rows, labels, max_length, truncation=p.truncation)
         has_eval = len(eval_set) > 0
 
         weights = None
@@ -282,21 +366,32 @@ class Finetune(Stage):
             if not labels.class_weights:
                 raise ValueError(f"{p.labels} carries no class weights; they are written by classifiers.prepare_data")
             weights = torch.tensor(labels.class_weights, dtype=torch.float32)
+        bias = None
+        if p.loss == "logit_adjusted":
+            if labels.multi:
+                raise ValueError("loss: logit_adjusted is for single-label tasks; multi-label imbalance is handled by thresholds")
+            bias = torch.tensor(log_prior(labels.counts or [], p.logit_adjustment_tau), dtype=torch.float32)
 
         def loss_fn(logits, targets, sample_weight):
             return classification_loss(
                 logits, targets, sample_weight, labels.problem_type,
                 weights.to(logits.device) if weights is not None else None,
                 p.focal_gamma if p.loss == "focal" else 0.0,
+                # Training batches only: evaluation reads the raw logits, as prediction will.
+                bias if model.training else None,
             )
 
         common = {
             "model": model, "train_dataset": train_set, "processing_class": tokenizer,
             "data_collator": Collator(tokenizer), "loss_fn": loss_fn,
         }
-        metrics: dict[str, float] = {"n_train": float(len(train_set)), "n_eval": float(len(eval_set))}
+        metrics: dict[str, float] = {
+            "n_train": float(len(train_set)), "n_eval": float(len(eval_set)),
+            "data/max_length": float(max_length), "data/truncated_fraction": truncated,
+        }
         soft = sum(1 for r in rows if r.get("probs") is not None)
         metrics["n_soft"] = float(soft)
+        train_args = p.train_args()
 
         checkpoints = ctx.out_dir / "checkpoints"
         last = resume_point(checkpoints, p.resume and ctx.resumed)
@@ -305,7 +400,7 @@ class Finetune(Stage):
             # through the pretrained encoder in the first steps.
             trainable = freeze_backbone(model, True)
             ctx.log.info("finetune: head warm-up, %d trainable parameters", trainable)
-            warm = p.train.model_copy(update={
+            warm = train_args.model_copy(update={
                 "learning_rate": p.head_warmup_lr, "num_train_epochs": p.head_warmup_epochs, "max_steps": -1,
                 "load_best_model_at_end": False, "eval_steps": None, "save_steps": None, "lr_scheduler_type": "linear",
             })
@@ -317,7 +412,7 @@ class Finetune(Stage):
             freeze_backbone(model, False)
 
         args = TrainingArguments(
-            **_keep_columns(p.train.to_kwargs(str(checkpoints), seed, has_eval, f"{ctx.pipeline}-{ctx.stage}"))
+            **_keep_columns(train_args.to_kwargs(str(checkpoints), seed, has_eval, f"{ctx.pipeline}-{ctx.stage}"))
         )
         optimizers: tuple[Any, Any] = (None, None)
         if p.llrd != 1.0 or p.head_lr_multiplier != 1.0:
@@ -334,15 +429,60 @@ class Finetune(Stage):
             args=args, eval_dataset=eval_set if has_eval else None, optimizers=optimizers,
             compute_metrics=make_compute_metrics(labels) if has_eval else None, **common,
         )
+        trainer.add_callback(history_callback(ctx.out_dir))
+        if p.early_stopping_patience:
+            from transformers import EarlyStoppingCallback
+
+            trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=p.early_stopping_patience))
         out = trainer.train(resume_from_checkpoint=last)
+        save_history(ctx.out_dir, trainer.state.log_history)
         metrics["train/loss"] = float(out.training_loss)
+        metrics["train/steps"] = float(trainer.state.global_step)
         if has_eval:
             metrics.update(final_metrics(trainer.evaluate()))
 
+        artifacts: dict[str, Any] = {}
+        if held_out:
+            artifacts["oof"], oof_metrics = write_out_of_fold(
+                ctx, trainer, tokenizer, held_out, labels, max_length, p.truncation, p.fold
+            )
+            metrics.update(oof_metrics)
         model_dir = ctx.out_dir / "model"
         _finish(trainer, tokenizer, model_dir, checkpoints, p.keep_checkpoints)
         labels.save(model_dir / LABELS_FILE)
+        write_preprocessing(model_dir, max_length, p.truncation)
+        artifacts["model"] = model_dir
         return StageResult(
-            artifacts={"model": model_dir}, metrics=metrics,
-            notes={"train_sources": source_counts(rows), **_resume_note(last)},
+            artifacts=artifacts, metrics=metrics,
+            notes={"train_sources": source_counts(rows), **model_notes, **_resume_note(last)},
         )
+
+
+def write_out_of_fold(
+    ctx: StageContext, trainer, tokenizer, held_out: list[dict[str, Any]], labels: LabelSpace, max_length: int,
+    truncation: str, fold: int,
+) -> tuple[Path, dict[str, float]]:
+    """Predict the rows this run did not train on and write them with their loss: `oof.jsonl`.
+    A row the model gets confidently wrong without ever having seen it is a candidate label error."""
+    from .metrics import classification_report, decide, probabilities, row_losses, targets_array
+    from .modeling import build_dataset
+
+    pred = trainer.predict(build_dataset(tokenizer, held_out, labels, max_length, truncation=truncation))
+    logits = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
+    kind = labels.problem_type
+    y = targets_array(held_out, len(labels), kind)
+    probs = probabilities(logits, kind)
+    guess = decide(probs, kind)
+    losses = row_losses(logits, y, kind)
+    path = ctx.path("oof.jsonl")
+    write_jsonl(path, (
+        {**{k: row[k] for k in ("text", "text_pair", "label", "labels") if k in row}, "fold": fold,
+         "loss": round(float(losses[i]), 6), "probs": [round(float(x), 6) for x in probs[i]],
+         "predicted": [c for c in range(len(labels)) if guess[i][c]] if labels.multi else int(guess[i])}
+        for i, row in enumerate(held_out)
+    ))
+    report = classification_report(guess, y, labels.names, kind)["metrics"]
+    return path, {
+        "n_oof": float(len(held_out)), "oof/loss": float(losses.mean()),
+        "oof/accuracy": report["accuracy"], "oof/macro_f1": report["macro_f1"],
+    }

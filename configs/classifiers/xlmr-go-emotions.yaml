@@ -1,9 +1,13 @@
 # Multi-label emotion classifier (28 labels, several per text) on a multilingual encoder:
 #
-#   data -> finetune -> calibration -> test -> export
+#   data -> finetune x {3 learning rates} -> best -> calibration -> test -> export
 #
-# The shortest useful multi-label pipeline: no domain adaptation, no self-training. Calibration
-# also picks a decision threshold per label, which matters more than the temperature here.
+# The short multi-label pipeline. Plain BCE, then calibration: a temperature and a decision
+# threshold per label, which matters more than the temperature here. Rare labels share one
+# threshold, because a cut fitted on a handful of positives is noise.
+#
+# For a multilingual task, jhu-clsp/mmBERT-base is the first alternative to try as `base_model`:
+# it beats XLM-R-base on XTREME in its authors' comparison. It was not compared with XLM-R-large.
 track: classifiers
 name: xlmr-go-emotions
 seed: 42
@@ -11,7 +15,6 @@ seed: 42
 vars:
   base_model: FacebookAI/xlm-roberta-base
   dataset: google-research-datasets/go_emotions
-  max_length: 128
 
 stages:
   - name: data
@@ -22,47 +25,48 @@ stages:
       train: {path: "${vars.dataset}", name: simplified, split: train}
       eval: {path: "${vars.dataset}", name: simplified, split: validation}
       test: {path: "${vars.dataset}", name: simplified, split: test}
+      calibration_fraction: 0.1       # out of train: thresholds are not fitted on the split that picks the checkpoint
     gate: {metric: n_labels, min: 2}
 
   - name: finetune
     kind: classifiers.finetune
+    matrix:
+      train.learning_rate: [1.0e-5, 2.0e-5, 3.0e-5]   # the range XLM-R is tuned in; ModernBERT's is higher
     params:
       init_from: ${vars.base_model}
       labels: ${data.labels}
       train_data: ${data.train}
       eval_data: ${data.eval}
-      max_length: ${vars.max_length}
-      loss: focal             # focal BCE: rare labels are not drowned by easy negatives
-      focal_gamma: 2.0        # alternative: `loss: ce` with `class_weights: balanced` (BCE pos_weight)
-      llrd: 0.9
-      head_lr_multiplier: 5
+      early_stopping_patience: 3
       train:
-        learning_rate: 2.0e-5
-        num_train_epochs: 4
+        num_train_epochs: 5
         per_device_train_batch_size: 32
         per_device_eval_batch_size: 128
         warmup: 0.06
+        eval_steps: 300
         group_by_length: true
-        load_best_model_at_end: true
-        metric_for_best_model: eval_micro_f1
+        metric_for_best_model: eval_micro_f1    # at threshold 0.5, before calibration
         greater_is_better: true
-    gate: {metric: eval/micro_f1, min: 0.3}   # at threshold 0.5, before calibration; a sanity floor
+
+  - name: best
+    kind: classifiers.select
+    params: {group: finetune, metric: eval/micro_f1}
+    gate: {metric: eval/micro_f1, min: 0.3}     # a sanity floor
 
   - name: calibration
     kind: classifiers.calibrate
     params:
-      model: ${finetune.model}
-      data: ${data.eval}
-      max_length: ${vars.max_length}
+      model: ${best.model}
+      data: ${data.calibration}
       fit_thresholds: true
+      min_positives: 20               # labels with fewer positives in the split share one threshold
 
   - name: test
     kind: classifiers.eval
     params:
-      model: ${finetune.model}
+      model: ${best.model}
       calibration: ${calibration.calibration}
       data: ${data.test}
-      max_length: ${vars.max_length}
     gate:   # floors to adjust once you have a first run; they are not measured results
       - {metric: eval/micro_f1, min: 0.45}
       - {metric: eval/macro_f1, min: 0.35}
@@ -71,6 +75,5 @@ stages:
     kind: classifiers.export
     needs: [test]
     params:
-      model: ${finetune.model}
+      model: ${best.model}
       calibration: ${calibration.calibration}
-      max_length: ${vars.max_length}

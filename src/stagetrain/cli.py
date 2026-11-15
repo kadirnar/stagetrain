@@ -1,4 +1,4 @@
-"""Command line: `stagetrain plan|run|status|kinds`."""
+"""Command line: `stagetrain plan|run|status|report|kinds`."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import sys
 
 from .core.config import TRACKS, ConfigError, load_config, parse_overrides
 from .core.pipeline import CACHED, GateFailed, Pipeline, PipelineError
+from .core.report import REPORT, write_report
 from .core.stage import kinds
 
 
@@ -17,6 +18,16 @@ def _table(rows: list[list[str]], header: list[str]) -> str:
     lines = ["  ".join(str(c).ljust(w) for c, w in zip(r, widths, strict=True)).rstrip() for r in [header, *rows]]
     lines.insert(1, "  ".join("-" * w for w in widths))
     return "\n".join(lines)
+
+
+def _short_needs(needs: list[str], groups: dict[str, list[str]]) -> list[str]:
+    """A stage that needs every run of a matrix is shown as needing the matrix: `sft (5 runs)`."""
+    out, used = [], set()
+    for group, runs in groups.items():
+        if runs and set(runs) <= set(needs):
+            out.append(f"{group} ({len(runs)} runs)")
+            used.update(runs)
+    return [n for n in needs if n not in used] + out
 
 
 def _pipeline(args: argparse.Namespace) -> Pipeline:
@@ -34,22 +45,45 @@ def cmd_plan(args: argparse.Namespace) -> int:
     rows = []
     for s in p.status():
         will = "run" if s.name in selected and (args.force or s.state != CACHED) else "skip"
-        rows.append([s.name, s.kind, ", ".join(s.needs) or "-", s.state, will])
+        rows.append([s.name, s.kind, ", ".join(_short_needs(s.needs, p.config.groups)) or "-", s.state, will])
     print(f"{p.config.track} / {p.config.name}  ->  {p.run_dir}")
     print(_table(rows, ["stage", "kind", "needs", "state", "next run"]))
     return 0
 
 
+def _refresh_report(p: Pipeline) -> None:
+    """Rewrite `report.html`; a report that cannot be written never stops a run."""
+    try:
+        write_report(p)
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("stagetrain").warning("could not write the report: %s", e)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     p = _pipeline(args)
+    refresh = None if args.dry_run or args.no_report else (lambda _manifest: _refresh_report(p))
     try:
         p.run(
             only=_split(args.only), start=args.start, until=args.until, force=args.force,
-            dry_run=args.dry_run, allow_stale=args.allow_stale,
+            dry_run=args.dry_run, allow_stale=args.allow_stale, after_stage=refresh,
         )
     except GateFailed as e:
         print(f"gate failed: {e}", file=sys.stderr)
         return 2
+    finally:
+        if refresh is not None:
+            _refresh_report(p)
+            logging.getLogger("stagetrain").info("report: %s", p.run_dir / REPORT)
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    path = write_report(_pipeline(args), args.out)
+    print(path)
+    if args.open:
+        import webbrowser
+
+        webbrowser.open(path.resolve().as_uri())
     return 0
 
 
@@ -107,7 +141,14 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--dry-run", action="store_true", help="validate and list, run nothing")
     sp.add_argument("--allow-stale", action="store_true",
                     help="with --only/--from: accept an earlier stage whose configuration changed since it ran")
+    sp.add_argument("--no-report", action="store_true", help="do not write report.html")
     sp.set_defaults(fn=cmd_run)
+
+    sp = sub.add_parser("report", help="write report.html: stages, gates, metrics and training curves")
+    common(sp, selection=False)
+    sp.add_argument("--out", help="where to write it (default: <run_dir>/report.html)")
+    sp.add_argument("--open", action="store_true", help="open it in the browser")
+    sp.set_defaults(fn=cmd_report)
 
     sp = sub.add_parser("status", help="show each stage's state and metrics")
     common(sp, selection=False)

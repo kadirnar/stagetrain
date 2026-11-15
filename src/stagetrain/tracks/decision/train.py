@@ -22,8 +22,10 @@ from stagetrain.core import (
     StageResult,
     TrainArgs,
     final_metrics,
+    history_callback,
     read_jsonl,
     register,
+    save_history,
     seed_everything,
 )
 
@@ -157,7 +159,7 @@ class Train(Stage):
             model=model, args=TrainingArguments(**kwargs), data_collator=collator,
             train_dataset=as_dataset(rows),
             eval_dataset=as_dataset([r.to_json() for r in eval_records]) if eval_records else None,
-            loss_config=p.loss, evaluator=evaluator,
+            loss_config=p.loss, evaluator=evaluator, callbacks=[history_callback(ctx.out_dir)],
         )
         # `ctx.resumed`: the directory holds an unfinished attempt of this same run, nothing older.
         last = get_last_checkpoint(str(checkpoints)) if p.resume and ctx.resumed and checkpoints.is_dir() else None
@@ -165,6 +167,7 @@ class Train(Stage):
             ctx.log.info("stage %s: resuming from %s", ctx.stage, last)
         result = trainer.train(resume_from_checkpoint=last)
 
+        save_history(ctx.out_dir, trainer.state.log_history)
         metrics = final_metrics({"train_loss": result.training_loss, "train_steps": trainer.state.global_step})
         metrics["train/records"] = float(len(rows))
         metrics["train/truncated_states"] = float(collator.truncated)

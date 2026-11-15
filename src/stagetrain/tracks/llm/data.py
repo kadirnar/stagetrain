@@ -176,6 +176,13 @@ def row_key(row: dict[str, Any]) -> str:
     return " ".join(canonical.lower().split())
 
 
+def question_key(row: dict[str, Any]) -> str:
+    """What a conversation asks: everything before its last assistant turn, the system message
+    aside. Rows that ask the same thing share a key, whatever their answers say."""
+    turns = [[m["role"], m["content"]] for m in row["messages"][:-1] if m["role"] != "system"]
+    return " ".join(json.dumps(turns, ensure_ascii=False).lower().split())
+
+
 def _unit(key: str, seed: int) -> float:
     return int(hashlib.sha1(f"{seed}:{key}".encode()).hexdigest()[:12], 16) / 16**12
 

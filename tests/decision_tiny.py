@@ -16,7 +16,8 @@ FILLER = ["the", "movie", "film", "was", "really", "quite", "and", "story", "act
 PROMPT_WORDS = (
     "QUESTION Options Answer with the code of one option yes or no number from to state question context "
     "Which sentiment does review have Is positive How good is it Choose correct answer "
-    "positive neutral negative praise complaint neither user assistant system [...] billing tech refund"
+    "positive neutral negative praise complaint neither user assistant system [...] billing tech refund "
+    "Proposed proposed correct None of the other options applies none above About record with id records content"
 )
 LEVELS = ["negative", "neutral", "positive"]
 

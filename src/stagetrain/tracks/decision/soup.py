@@ -6,9 +6,9 @@ import shutil
 from pathlib import Path
 from typing import Literal
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
-from stagetrain.core import Stage, StageContext, StageParams, StageResult, register
+from stagetrain.core import Stage, StageContext, StageParams, StageResult, group_runs, register
 from stagetrain.core.soup import average_checkpoints
 
 from .metrics import summarize
@@ -17,7 +17,8 @@ from .prompt import PromptStyle
 
 
 class SoupParams(StageParams):
-    models: list[str]  # full checkpoints of one architecture: `decision.train` stages' `model`
+    models: list[str] = Field(default_factory=list)  # full checkpoints of one architecture: `decision.train` stages' `model`
+    group: str | None = None  # or: every run of this matrix (e.g. one decision.train over several seeds)
     method: Literal["uniform", "greedy"] = "uniform"
     weights: list[float] | None = None  # uniform only
     # greedy: held-out records; a checkpoint joins the soup only if the soup then scores no worse
@@ -30,8 +31,8 @@ class SoupParams(StageParams):
 
     @model_validator(mode="after")
     def _check(self) -> SoupParams:
-        if not self.models:
-            raise ValueError("a soup needs at least one model")
+        if not self.models and not self.group:
+            raise ValueError("a soup needs models, or the group of a matrix")
         if self.method == "greedy" and not self.data:
             raise ValueError("a greedy soup needs held-out data")
         if self.method == "greedy" and self.weights:
@@ -64,14 +65,20 @@ class Soup(Stage):
         p = self.params
         out = ctx.out_dir / "model"
         shutil.rmtree(out, ignore_errors=True)
-        notes: dict = {"models": list(p.models)}
+        models = list(p.models)
+        if p.group:
+            runs = group_runs(ctx.upstream, p.group)
+            if not runs:
+                raise ValueError(f"soup: {p.group!r} is not a matrix this stage depends on")
+            models += [m.artifact("model", ctx.run_dir) for m in runs.values()]
+        notes: dict = {"models": models}
         if p.method == "uniform":
-            average_checkpoints(p.models, out, p.weights)
-            members = list(p.models)
+            average_checkpoints(models, out, p.weights)
+            members = list(models)
             metrics = {"soup/members": float(len(members))}
         else:
-            single = {m: self.score(m) for m in p.models}
-            ranked = sorted(p.models, key=single.__getitem__, reverse=True)
+            single = {m: self.score(m) for m in models}
+            ranked = sorted(models, key=single.__getitem__, reverse=True)
             members, best = [ranked[0]], single[ranked[0]]
             average_checkpoints(members, out)
             candidate = ctx.out_dir / "candidate"

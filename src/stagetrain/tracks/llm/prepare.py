@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -24,6 +25,8 @@ from .data import (
     chunk_text,
     normalise_chat,
     normalise_preference,
+    question_key,
+    row_key,
     split_rows,
 )
 
@@ -38,6 +41,9 @@ class ChatSource(BaseModel):
     source: DataSource
     format: Literal["messages", "sharegpt", "alpaca", "prompt_completion"] = "messages"
     system: str | None = None
+    # General-purpose data mixed into the training rows so the model keeps what it could already
+    # do: this many rows per task row (0.05 = 5 %). Replay rows never reach the eval or test split.
+    replay_ratio: float | None = Field(default=None, gt=0.0)
 
 
 class TextSource(BaseModel):
@@ -63,7 +69,10 @@ class PrepareParams(StageParams):
     chat: list[ChatSource] = Field(default_factory=list)
     text: list[TextSource] = Field(default_factory=list)
     preference: list[PreferenceSource] = Field(default_factory=list)
-    eval_fraction: float = Field(default=0.02, ge=0.0, le=0.5)
+    eval_fraction: float = Field(default=0.02, ge=0.0, le=0.5)  # validation: picks checkpoints and settings
+    # A second held-out split that nothing is selected on, for the number that gets reported.
+    # Choosing the best of many checkpoints on one split makes that split's score optimistic.
+    test_fraction: float = Field(default=0.0, ge=0.0, le=0.5)
     max_eval: int | None = 1000
     min_chars: int = 1  # rows shorter or longer than this, counted over message contents, are dropped
     max_chars: int | None = None
@@ -133,23 +142,42 @@ class PrepareData(Stage):
             if not sources:
                 continue
             collector = collectors[kind]
-            for src in sources:
+            task_sources = [src for src in sources if not getattr(src, "replay_ratio", None)]
+            for src in task_sources:
                 collector.extend(load_source(src.source), converter(src))
             if not collector.rows:
                 raise ValueError(f"{kind}: no usable row in {len(sources)} source(s); dropped: {collector.rejected}")
-            train, held_out = split_rows(collector.rows, p.eval_fraction, p.max_eval, seed)
-            result.artifacts[f"{kind}_train"] = ctx.path(f"{kind}.train.jsonl")
-            result.artifacts[f"{kind}_eval"] = ctx.path(f"{kind}.eval.jsonl")
-            write_jsonl(result.artifacts[f"{kind}_train"], train)
-            write_jsonl(result.artifacts[f"{kind}_eval"], held_out)
-            stats[kind] = {**collector.stats(), "train": len(train), "eval": len(held_out)}
+            # A conversation's side is decided by its question alone, so two rows that ask the same
+            # thing with different answers never end up on both sides of a split.
+            key = question_key if kind == "chat" else row_key
+            train, test = split_rows(collector.rows, p.test_fraction, p.max_eval, seed + 1, key=key)
+            train, held_out = split_rows(train, p.eval_fraction, p.max_eval, seed, key=key)
+            replayed = 0
+            for src in sources:
+                if src in task_sources:
+                    continue
+                pool = Collector(p.dedupe)
+                pool.extend(load_source(src.source), converter(src))
+                rows = pool.rows[: round(src.replay_ratio * len(train))]
+                replayed += len(rows)
+                train = train + rows
+            if replayed:
+                random.Random(seed).shuffle(train)
+            parts = {"train": train, "eval": held_out}
+            if p.test_fraction > 0:
+                parts["test"] = test
+            for part, rows in parts.items():
+                result.artifacts[f"{kind}_{part}"] = ctx.path(f"{kind}.{part}.jsonl")
+                write_jsonl(result.artifacts[f"{kind}_{part}"], rows)
+                result.metrics[f"{kind}/{part}_rows"] = len(rows)
+            stats[kind] = {**collector.stats(), **{part: len(rows) for part, rows in parts.items()}, "replay": replayed}
             result.metrics.update({
-                f"{kind}/train_rows": len(train),
-                f"{kind}/eval_rows": len(held_out),
                 f"{kind}/duplicates": collector.duplicates,
                 f"{kind}/rejected": sum(collector.rejected.values()),
             })
-            ctx.log.info("prepare_data: %s train=%d eval=%d dropped=%s", kind, len(train), len(held_out), collector.rejected)
+            if replayed:
+                result.metrics[f"{kind}/replay_rows"] = replayed
+            ctx.log.info("prepare_data: %s %s dropped=%s", kind, {k: len(v) for k, v in parts.items()}, collector.rejected)
         result.artifacts["stats"] = write_json(ctx.path("stats.json"), stats)
         result.notes = stats
         return result

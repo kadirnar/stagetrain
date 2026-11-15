@@ -24,6 +24,9 @@ from .labels import (
     summarize,
 )
 
+HELD_OUT = ("test", "eval", "calibration")  # in the order they are protected and carved
+SPLITS = ("train", "eval", "calibration", "test")
+
 
 def _as_list(v: Any) -> Any:
     if v is None:
@@ -37,19 +40,23 @@ class PrepareParams(StageParams):
     `text_pair` column makes sentence-pair tasks."""
 
     train: list[DataSource]
-    eval: list[DataSource] = Field(default_factory=list)  # model selection and calibration
+    eval: list[DataSource] = Field(default_factory=list)  # model selection: checkpoints, settings, seeds
+    # Fits the temperature and the thresholds. Its own split, because the split a checkpoint was
+    # picked on flatters that checkpoint: calibrating there gives over-confident probabilities.
+    calibration: list[DataSource] = Field(default_factory=list)
     test: list[DataSource] = Field(default_factory=list)  # the final, untouched measurement
     unlabeled: list[DataSource] = Field(default_factory=list)  # `text` only: MLM adaptation, pseudo-labelling
     problem_type: Literal["single_label", "multi_label"] = "single_label"
     labels: list[str] | None = None  # fixes the classes and their order; inferred from train when None
     label_separator: str = ","
     eval_fraction: float = 0.1  # carved out of train, stratified, when no eval source is given
+    calibration_fraction: float = 0.0  # likewise for calibration
     test_fraction: float = 0.0  # likewise for test
     drop_conflicts: bool = True  # drop texts that carry two different labels
     min_chars: int = 1
     max_class_weight: float = 10.0
 
-    @field_validator("train", "eval", "test", "unlabeled", mode="before")
+    @field_validator("train", "eval", "calibration", "test", "unlabeled", mode="before")
     @classmethod
     def _sources(cls, v: Any) -> Any:
         return _as_list(v)
@@ -119,7 +126,7 @@ def encode_labels(rows: list[dict[str, Any]], space: LabelSpace, where: str) -> 
 
 @register("classifiers.prepare_data")
 class PrepareData(Stage):
-    """Build the label map and clean, leak-free, deterministic train/eval/test splits."""
+    """Build the label map and clean, leak-free, deterministic train / eval / calibration / test splits."""
 
     Params = PrepareParams
 
@@ -128,7 +135,7 @@ class PrepareData(Stage):
         multi = p.problem_type == MULTI
         raw = {
             split: [r for src in getattr(p, split) for r in read_labeled(src, multi, p.label_separator)]
-            for split in ("train", "eval", "test")
+            for split in SPLITS
         }
         if not raw["train"]:
             raise ValueError("the train sources hold no labelled row")
@@ -145,21 +152,25 @@ class PrepareData(Stage):
             for k, v in s.items():
                 stats[k] += v
 
-        # Held-out splits win: a text in test leaves eval and train, a text in eval leaves train.
-        rows["eval"], n = remove_leaks(rows["eval"], rows["test"])
-        stats["leaked"] += n
-        rows["train"], n = remove_leaks(rows["train"], [*rows["eval"], *rows["test"]])
+        # Held-out splits win, the most protected first: a text in test leaves every other split,
+        # a text in eval leaves calibration and train, a text in calibration leaves train.
+        for i, split in enumerate(HELD_OUT[1:], start=1):
+            rows[split], n = remove_leaks(rows[split], [r for earlier in HELD_OUT[:i] for r in rows[earlier]])
+            stats["leaked"] += n
+        rows["train"], n = remove_leaks(rows["train"], [r for split in HELD_OUT for r in rows[split]])
         stats["leaked"] += n
 
         seed = self.seed(ctx)
         counts = label_counts(rows["train"], len(space))
-        for split, fraction in (("test", p.test_fraction), ("eval", p.eval_fraction)):
+        carved = 0.0  # the share of the original train set already given away
+        for split in HELD_OUT:
+            fraction = getattr(p, f"{split}_fraction")
             if not rows[split] and fraction > 0:
-                # The fraction is of the original train set, whichever split is carved first.
-                share = fraction / (1 - p.test_fraction) if split == "eval" and not p.test else fraction
+                # Every fraction is of the original train set, whichever split is carved first.
                 rows["train"], rows[split] = stratified_split(
-                    rows["train"], min(share, 0.9), seed, lambda r: stratum(r, counts)
+                    rows["train"], min(fraction / (1 - carved), 0.9), seed, lambda r: stratum(r, counts)
                 )
+                carved += fraction
         if not rows["train"]:
             raise ValueError("no train row is left after cleaning and splitting")
 
@@ -178,7 +189,7 @@ class PrepareData(Stage):
             pool = [r for src in p.unlabeled for r in read_unlabeled(src)]
             pool = [r for r in pool if len(r["text"]) >= p.min_chars]
             pool, _ = dedupe(pool)
-            pool, n = remove_leaks(pool, [*rows["train"], *rows["eval"], *rows["test"]])
+            pool, n = remove_leaks(pool, [r for split in SPLITS for r in rows[split]])
             stats["unlabeled_overlap"] = n
             write_jsonl(ctx.path("unlabeled.jsonl"), pool)
             artifacts["unlabeled"] = ctx.out_dir / "unlabeled.jsonl"

@@ -7,6 +7,7 @@ import shutil
 import time
 import traceback
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -205,10 +206,12 @@ class Pipeline:
         force: bool = False,
         dry_run: bool = False,
         allow_stale: bool = False,
+        after_stage: Callable[[Manifest], None] | None = None,
     ) -> list[Manifest]:
         """Run the selected stages in order. A stage that already finished with the same
         configuration and the same upstream runs is skipped unless `force`. Returns the manifests
-        of the selected stages; raises `GateFailed` at the first stage whose gate does not hold."""
+        of the selected stages; raises `GateFailed` at the first stage whose gate does not hold.
+        `after_stage` is called with the manifest of every stage that ran, also when it failed."""
         selected = self.select(only, start, until)
         self.validate()
         if dry_run:
@@ -228,7 +231,11 @@ class Pipeline:
             else:
                 if state not in (PENDING, CACHED, GATE_FAILED):
                     log.info("stage %s: %s (%s)", spec.name, state, reason)
-                m = self._execute(spec)
+                try:
+                    m = self._execute(spec)
+                finally:
+                    if after_stage is not None:
+                        after_stage(self.manifest(spec.name))
             results = self._gate_results(spec, m)
             if results != m.gates:
                 m.gates = results
@@ -273,7 +280,7 @@ class Pipeline:
         )
         m = Manifest(
             name=spec.name, kind=spec.kind, status=RUNNING, fingerprint=self.fingerprint(spec.name),
-            run_id=uuid.uuid4().hex[:12], params=stage.params.model_dump(mode="json"),
+            run_id=uuid.uuid4().hex[:12], params=stage.params.model_dump(mode="json"), variant=dict(spec.variant),
             upstream={dep: dm.run_id for dep, dm in upstream.items()},
             started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"), env=environment(),
         )
