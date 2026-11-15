@@ -7,10 +7,10 @@ Importing this package registers the stages. Unsloth, torch and TRL are imported
 stage runs (`backend.py`), so planning and validating a pipeline needs none of them.
 """
 
-from . import evaluate, export, generate, prepare, select, train  # noqa: F401
-from .backend import UnslothBackend, get_backend, set_backend
+from . import check, evaluate, export, external, generate, prepare, select, train  # noqa: F401
+from .backend import BACKENDS, UnslothBackend, get_backend, set_backend
 
-__all__ = ["UnslothBackend", "get_backend", "set_backend"]
+__all__ = ["BACKENDS", "UnslothBackend", "get_backend", "set_backend"]
 
 from stagetrain.core.select import register_select  # noqa: E402
 

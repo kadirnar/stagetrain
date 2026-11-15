@@ -43,7 +43,7 @@ class Export(Stage):
 
     def run(self, ctx: StageContext) -> StageResult:
         p: ExportParams = self.params
-        backend = get_backend()
+        backend = get_backend(p.backend)
         model, tokenizer = backend.load(p.load_spec())
         if p.chat_template:
             tokenizer = backend.set_chat_template(tokenizer, p.chat_template)

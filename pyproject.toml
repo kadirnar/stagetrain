@@ -15,8 +15,18 @@ dependencies = [
 
 [project.optional-dependencies]
 # Every track is independent: install only the extra you train with.
+# The Unsloth backend. Unsloth pins older transformers / trl / torch: give it its own environment.
 llm = [
     "unsloth",
+    "trl",
+    "peft",
+    "transformers",
+    "datasets",
+    "accelerate",
+]
+# The hf backend: plain transformers + PEFT + TRL, one GPU or several. No Unsloth.
+llm-hf = [
+    "torch",
     "trl",
     "peft",
     "transformers",

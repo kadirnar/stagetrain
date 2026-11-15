@@ -1,0 +1,104 @@
+# Fine-tuning on several GPUs with the hf backend: plain transformers + PEFT + TRL, one process
+# per GPU under torchrun. No Unsloth needed.
+#
+#   stagetrain plan configs/llm/multi-gpu.yaml
+#   stagetrain run  configs/llm/multi-gpu.yaml
+#   stagetrain run  configs/llm/multi-gpu.yaml --set vars.gpus=2     # see the note on batch sizes
+#
+# A training stage with `launch: {num_processes: N}` is started as
+#   torchrun --nproc_per_node N -m stagetrain.worker <stage>/job.json
+# and its result is read back; the other stages run in the pipeline's own process on one GPU.
+#
+# The effective batch size is per_device_train_batch_size x gradient_accumulation_steps x GPUs.
+# Here it is 4 x 1 x 4 = 16; with another number of GPUs, change one of the factors to keep it.
+
+track: llm
+name: qwen3-4b-multi-gpu
+seed: 3407
+
+vars:
+  base_model: Qwen/Qwen3-4B
+  gpus: 4
+  model: &model
+    backend: hf
+    max_seq_length: 2048
+    load_in: 16bit
+    chat_template_kwargs: {enable_thinking: false}
+
+stages:
+  - name: data
+    kind: llm.prepare_data
+    params:
+      chat:
+        - source: {path: data/domain_chat.jsonl}      # {"messages": [{"role": ..., "content": ...}]}
+      eval_fraction: 0.05
+      test_fraction: 0.1
+
+  # Drop rows that are certainly useless and list the doubtful ones before spending GPU time.
+  - name: quality
+    kind: llm.check_data
+    params:
+      chat: ${data.chat_train}
+      held_out: ["${data.chat_eval}", "${data.chat_test}"]
+      max_seq_length: 2048
+    gate: {metric: quality/chat_drop_rate, max: 0.3}
+
+  - name: eval_base
+    kind: llm.eval
+    params:
+      <<: *model
+      init_from: ${vars.base_model}
+      eval_data: ${data.chat_test}
+      scorer: {name: contains}
+      measure_loss: false
+
+  # LoRA SFT on four GPUs (DDP).
+  - name: sft
+    kind: llm.sft
+    params:
+      <<: *model
+      init_from: ${vars.base_model}
+      train_data: ${quality.chat}
+      eval_data: ${data.chat_eval}
+      lora: {r: 64, alpha: 32}
+      launch: {num_processes: "${vars.gpus}"}
+      train: {learning_rate: 2.0e-4, num_train_epochs: 3, per_device_train_batch_size: 4, gradient_accumulation_steps: 1}
+
+  - name: pick
+    kind: llm.select_checkpoint
+    params:
+      <<: *model
+      init_from: ${sft.checkpoints}
+      eval_data: ${data.chat_eval}
+      scorer: {name: contains}
+
+  - name: eval_sft
+    kind: llm.eval
+    params:
+      <<: *model
+      init_from: ${pick.model}
+      eval_data: ${data.chat_test}
+      scorer: {name: contains}
+      measure_loss: false
+      compare_to: ${eval_base.scores}
+    gate: {metric: eval/delta_ci_low, min: 0.0}
+
+  # Full fine-tuning of a model that does not fit on one GPU: FSDP2 shards it over the four.
+  - name: full
+    kind: llm.sft
+    enabled: false
+    params:
+      <<: *model
+      init_from: ${vars.base_model}
+      full_finetuning: true
+      train_data: ${quality.chat}
+      launch: {num_processes: "${vars.gpus}", fsdp: true}
+      train: {learning_rate: 1.0e-5, num_train_epochs: 2, per_device_train_batch_size: 2, gradient_accumulation_steps: 2}
+
+  - name: export
+    kind: llm.export
+    needs: [eval_sft]
+    params:
+      <<: *model
+      init_from: ${pick.model}
+      formats: [lora, merged_16bit]

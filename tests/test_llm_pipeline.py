@@ -278,7 +278,7 @@ def test_importing_the_track_needs_no_training_library():
     code = (
         "import sys, stagetrain.tracks.llm\n"
         "from stagetrain.core import kinds\n"
-        "assert set(kinds('llm')) == {'llm.prepare_data', 'llm.cpt', 'llm.sft', 'llm.dpo', 'llm.grpo', 'llm.eval', 'llm.export', 'llm.select', 'llm.select_checkpoint', 'llm.generate_data'}\n"
+        "assert set(kinds('llm')) == {'llm.prepare_data', 'llm.cpt', 'llm.sft', 'llm.dpo', 'llm.grpo', 'llm.eval', 'llm.export', 'llm.select', 'llm.select_checkpoint', 'llm.generate_data', 'llm.check_data', 'llm.axolotl', 'llm.swift'}\n"
         "heavy = [m for m in ('torch', 'transformers', 'trl', 'unsloth', 'datasets', 'peft') if m in sys.modules]\n"
         "assert not heavy, heavy\n"
     )

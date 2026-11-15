@@ -19,13 +19,15 @@ When `init_from` is a LoRA adapter, `on_adapter` decides how training goes on:
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
-from stagetrain.core import Stage, StageContext, StageParams, StageResult, read_jsonl, register, write_json
+from stagetrain.core import StageContext, StageParams, StageResult, read_jsonl, register, write_json
 from stagetrain.core.history import save_history
+from stagetrain.core.launch import LaunchableStage, LaunchSpec, is_main_process
 from stagetrain.core.training import seed_everything
 
 from .backend import (
@@ -54,6 +56,9 @@ class ModelParams(StageParams):
     """How a stage loads its model."""
 
     init_from: str  # a Hub id, or an earlier stage's artifact such as ${sft.model}
+    # unsloth: its loaders, kernels, vLLM generation and GGUF export (needs a CUDA GPU).
+    # hf: plain transformers + PEFT + TRL + accelerate; runs anywhere and on several GPUs.
+    backend: Literal["unsloth", "hf"] = "unsloth"
     max_seq_length: int = 2048
     load_in: Literal["4bit", "8bit", "16bit"] = "4bit"
     full_finetuning: bool = False
@@ -88,6 +93,9 @@ class TrainParams(ModelParams):
     # A row longer than max_seq_length is dropped, not cut: a cut row teaches an answer (or a
     # reasoning trace) that stops in the middle. `truncate` keeps the library's behaviour.
     overlength: Literal["drop", "truncate"] = "drop"
+    # One process per GPU: {num_processes: 4}. The pipeline starts the stage under
+    # `accelerate launch` (or torchrun) and reads its result back; see stagetrain.core.launch.
+    launch: LaunchSpec = Field(default_factory=LaunchSpec)
 
 
 class CptParams(TrainParams):
@@ -170,7 +178,10 @@ class GrpoParams(TrainParams):
             self.train, output_dir="unused", seed=0, num_generations=self.num_generations,
             max_completion_length=self.max_completion_length, temperature=self.temperature, top_p=self.top_p,
             loss_type=self.loss_type, beta=self.beta, importance_sampling_level=self.importance_sampling_level,
+            num_processes=self.launch.num_processes,
         )
+        if self.fast_inference and self.backend != "unsloth":
+            raise ValueError("fast_inference (vLLM generation) needs backend: unsloth")
         if self.max_completion_length >= self.max_seq_length:
             raise ValueError("max_completion_length must leave room for the prompt inside max_seq_length")
         return self
@@ -240,14 +251,21 @@ def render_text(tokenizer, rows: list[dict[str, Any]]) -> list[str]:
 
 def prepare_model(p: TrainParams, ctx: StageContext, seed: int, train_embeddings: bool = False):
     """`(model, tokenizer, info)` ready to train, following `on_adapter` (see the module docstring)."""
-    backend = get_backend()
+    backend = get_backend(p.backend)
     model, tokenizer = backend.load(p.load_spec())
-    info: dict[str, Any] = {"init_from": p.init_from, "trains_embeddings": train_embeddings and not p.full_finetuning}
+    info: dict[str, Any] = {
+        "init_from": p.init_from, "backend": p.backend, "trains_embeddings": train_embeddings and not p.full_finetuning,
+    }
     started_from_adapter = backend.has_adapter(model)
     if started_from_adapter and (p.on_adapter == "merge" or p.full_finetuning):
         merged = stage_dir(ctx, "merged_base")
-        ctx.log.info("stage %s: merging the adapter of %s into %s", ctx.stage, p.init_from, merged)
-        backend.save_merged(model, tokenizer, merged, "merged_16bit")
+        done = merged / "merged.ok"
+        if is_main_process():
+            ctx.log.info("stage %s: merging the adapter of %s into %s", ctx.stage, p.init_from, merged)
+            backend.save_merged(model, tokenizer, merged, "merged_16bit")
+            done.write_text("ok")
+        else:
+            wait_for(done)  # in a distributed run one process writes the merged model, the others read it
         model = tokenizer = None  # free the old model before the merged one is loaded
         backend.release()
         model, tokenizer = backend.load(p.load_spec(str(merged)))
@@ -267,6 +285,14 @@ def prepare_model(p: TrainParams, ctx: StageContext, seed: int, train_embeddings
     return model, tokenizer, info
 
 
+def wait_for(path: Path, timeout: float = 3600.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"waited {timeout:.0f}s for {path}, which the main process should have written")
+        time.sleep(2.0)
+
+
 def embedding_lr(p: TrainParams, trains_embeddings: bool) -> float | None:
     """Unsloth's recipe trains the embedding matrices 2-10x slower than the LoRA weights. That
     also holds for a later stage that continues an adapter whose embeddings are trained."""
@@ -275,13 +301,18 @@ def embedding_lr(p: TrainParams, trains_embeddings: bool) -> float | None:
     return p.train.learning_rate / 10 if trains_embeddings else None
 
 
-def finish(ctx: StageContext, model, tokenizer, out: TrainOutput, info: dict[str, Any], rows: dict[str, int]) -> StageResult:
-    backend = get_backend()
+def finish(
+    ctx: StageContext, backend, model, tokenizer, out: TrainOutput, info: dict[str, Any], rows: dict[str, int]
+) -> StageResult:
+    if not is_main_process():  # a secondary process of a distributed run writes nothing
+        return StageResult()
     model_dir = stage_dir(ctx, "model")
     backend.save(model, tokenizer, model_dir)
     model = tokenizer = None
     backend.release()
-    metrics = dict(out.metrics)
+    # What a trainer reports without a group (epoch, reward, completions/mean_length, ...) is about
+    # the training run.
+    metrics = {k if k.startswith(("train/", "eval/")) else f"train/{k}": v for k, v in out.metrics.items()}
     if "eval/loss" in metrics and math.isfinite(metrics["eval/loss"]):
         metrics["eval/perplexity"] = math.exp(min(metrics["eval/loss"], 50.0))
     metrics.update({f"{k}/rows": float(v) for k, v in rows.items()})
@@ -294,7 +325,10 @@ def finish(ctx: StageContext, model, tokenizer, out: TrainOutput, info: dict[str
     return StageResult(artifacts=artifacts, metrics=metrics, notes=info)
 
 
-def _text_stage(stage: Stage, ctx: StageContext, render, masking: ResponsesOnly | None, train_embeddings: bool) -> StageResult:
+def _text_stage(
+    stage: LaunchableStage, ctx: StageContext, render, masking: ResponsesOnly | None, train_embeddings: bool,
+    chat: bool = False,
+) -> StageResult:
     p: TrainParams = stage.params
     seed = stage.seed(ctx)
     seed_everything(seed)
@@ -302,15 +336,18 @@ def _text_stage(stage: Stage, ctx: StageContext, render, masking: ResponsesOnly 
     eval_rows = read_rows(p.eval_data, p.max_eval_samples)
     if not train_rows:
         raise ValueError(f"{p.train_data} holds no training row")
-    backend = get_backend()
+    backend = get_backend(p.backend)
     model, tokenizer, info = prepare_model(p, ctx, seed, train_embeddings)
     train_texts, eval_texts = render(tokenizer, train_rows), render(tokenizer, eval_rows)
     dropped = 0
     if p.overlength == "drop":
         keep = within_length(backend, tokenizer, train_texts, p.max_seq_length)
+        keep_eval = within_length(backend, tokenizer, eval_texts, p.max_seq_length)
         dropped = len(keep) - sum(keep)
         train_texts = [t for t, ok in zip(train_texts, keep, strict=True) if ok]
-        eval_texts = [t for t, ok in zip(eval_texts, within_length(backend, tokenizer, eval_texts, p.max_seq_length), strict=True) if ok]
+        train_rows = [r for r, ok in zip(train_rows, keep, strict=True) if ok]
+        eval_texts = [t for t, ok in zip(eval_texts, keep_eval, strict=True) if ok]
+        eval_rows = [r for r, ok in zip(eval_rows, keep_eval, strict=True) if ok]
         if not train_texts:
             raise ValueError(f"every training row is longer than max_seq_length={p.max_seq_length} tokens")
         if dropped:
@@ -323,9 +360,13 @@ def _text_stage(stage: Stage, ctx: StageContext, render, masking: ResponsesOnly 
     out = backend.train_text(
         model, tokenizer, train_texts, eval_texts, config, responses_only=masking, resume=p.resume and ctx.resumed,
         history_dir=ctx.out_dir,
+        # The conversations the texts were rendered from: a backend that masks the loss itself needs them.
+        conversations=[r["messages"] for r in train_rows] if chat else None,
+        eval_conversations=[r["messages"] for r in eval_rows] if chat else None,
     )
-    result = finish(ctx, model, tokenizer, out, info, {"train": len(train_texts), "eval": len(eval_texts)})
-    result.metrics["train/dropped_overlength"] = float(dropped)
+    result = finish(ctx, backend, model, tokenizer, out, info, {"train": len(train_texts), "eval": len(eval_texts)})
+    if is_main_process():
+        result.metrics["train/dropped_overlength"] = float(dropped)
     return result
 
 
@@ -335,37 +376,37 @@ def _text_stage(stage: Stage, ctx: StageContext, render, masking: ResponsesOnly 
 
 
 @register("llm.cpt")
-class ContinuedPretraining(Stage):
+class ContinuedPretraining(LaunchableStage):
     """Continued pretraining on raw domain text, with the embeddings and the output head trained too."""
 
     Params = CptParams
 
-    def run(self, ctx: StageContext) -> StageResult:
+    def execute(self, ctx: StageContext) -> StageResult:
         return _text_stage(self, ctx, render_text, None, self.params.train_embeddings)
 
 
 @register("llm.sft")
-class SupervisedFineTuning(Stage):
+class SupervisedFineTuning(LaunchableStage):
     """Chat fine-tuning through the tokenizer's chat template, with the loss on assistant turns only."""
 
     Params = SftParams
 
-    def run(self, ctx: StageContext) -> StageResult:
+    def execute(self, ctx: StageContext) -> StageResult:
         kwargs = self.params.chat_template_kwargs
 
         def render(tokenizer, rows):
             return render_chat(tokenizer, rows, kwargs)
 
-        return _text_stage(self, ctx, render, self.params.masking(), False)
+        return _text_stage(self, ctx, render, self.params.masking(), False, chat=True)
 
 
 @register("llm.dpo")
-class PreferenceOptimisation(Stage):
+class PreferenceOptimisation(LaunchableStage):
     """Direct preference optimisation on prompt / chosen / rejected pairs (TRL's DPOTrainer)."""
 
     Params = DpoParams
 
-    def run(self, ctx: StageContext) -> StageResult:
+    def execute(self, ctx: StageContext) -> StageResult:
         p: DpoParams = self.params
         seed = self.seed(ctx)
         seed_everything(seed)
@@ -373,7 +414,7 @@ class PreferenceOptimisation(Stage):
         eval_rows = read_rows(p.eval_data, p.max_eval_samples)
         if not train_rows:
             raise ValueError(f"{p.train_data} holds no preference pair")
-        backend = get_backend()
+        backend = get_backend(p.backend)
         model, tokenizer, info = prepare_model(p, ctx, seed)
         config = dpo_config_kwargs(
             p.train, output_dir=stage_dir(ctx, "checkpoints"), seed=seed, has_eval=bool(eval_rows),
@@ -383,7 +424,7 @@ class PreferenceOptimisation(Stage):
         out = backend.train_dpo(
             model, tokenizer, train_rows, eval_rows, config, resume=p.resume and ctx.resumed, history_dir=ctx.out_dir
         )
-        return finish(ctx, model, tokenizer, out, info, {"train": len(train_rows), "eval": len(eval_rows)})
+        return finish(ctx, backend, model, tokenizer, out, info, {"train": len(train_rows), "eval": len(eval_rows)})
 
 
 def reward_trend(log_history: list[dict[str, Any]]) -> dict[str, float]:
@@ -398,19 +439,19 @@ def reward_trend(log_history: list[dict[str, Any]]) -> dict[str, float]:
 
 
 @register("llm.grpo")
-class ReinforcementLearning(Stage):
+class ReinforcementLearning(LaunchableStage):
     """Reinforcement learning with verifiable rewards: GRPO and its variants (DAPO, Dr. GRPO, BNPO, GSPO)."""
 
     Params = GrpoParams
 
-    def run(self, ctx: StageContext) -> StageResult:
+    def execute(self, ctx: StageContext) -> StageResult:
         p: GrpoParams = self.params
         seed = self.seed(ctx)
         seed_everything(seed)
         chats = [r for r in read_rows(p.train_data, p.max_train_samples) if len(r.get("messages") or []) >= 2]
         if not chats:
             raise ValueError(f"{p.train_data} holds no conversation with a prompt and a reference answer")
-        backend = get_backend()
+        backend = get_backend(p.backend)
         model, tokenizer, info = prepare_model(p, ctx, seed)
         if p.fast_inference and info["trains_embeddings"]:
             raise ValueError(
@@ -434,11 +475,13 @@ class ReinforcementLearning(Stage):
             loss_type=p.loss_type, beta=p.beta, importance_sampling_level=p.importance_sampling_level,
             reward_weights=weights, mask_truncated_completions=p.mask_truncated_completions,
             template_kwargs=p.chat_template_kwargs, run_name=f"{ctx.pipeline}-{ctx.stage}", bf16=backend.bf16_supported(),
+            num_processes=p.launch.num_processes,
         )
         out = backend.train_grpo(
             model, tokenizer, rows, functions, config, resume=p.resume and ctx.resumed, history_dir=ctx.out_dir
         )
-        result = finish(ctx, model, tokenizer, out, info, {"train": len(rows)})
-        result.metrics.update(reward_trend(out.log_history))
-        result.metrics["train/dropped_overlength"] = float(len(chats) - len(rows))
+        result = finish(ctx, backend, model, tokenizer, out, info, {"train": len(rows)})
+        if is_main_process():
+            result.metrics.update(reward_trend(out.log_history))
+            result.metrics["train/dropped_overlength"] = float(len(chats) - len(rows))
         return result

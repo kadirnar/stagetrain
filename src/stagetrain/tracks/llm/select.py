@@ -68,7 +68,7 @@ class SelectCheckpoint(Stage):
         rows = read_rows(p.eval_data, p.max_samples)
         if not rows:
             raise ValueError(f"{p.eval_data} holds no evaluation row")
-        backend = get_backend()
+        backend = get_backend(p.backend)
         table: list[dict[str, Any]] = []
         for step, path in picked:
             model, tokenizer = backend.load(p.load_spec(str(path)))

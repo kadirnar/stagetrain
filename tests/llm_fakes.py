@@ -73,7 +73,7 @@ class FakeBackend:
             (path / "adapter_config.json").write_text(json.dumps({"base_model_name_or_path": model.name}))
 
     def train_text(self, model, tokenizer, train_texts, eval_texts, config, *, responses_only=None, resume=True,
-                   history_dir=None):
+                   history_dir=None, conversations=None, eval_conversations=None):
         self.calls.append(("train_text", {
             "model": model.name, "train": list(train_texts), "eval": list(eval_texts), "config": config,
             "responses_only": responses_only, "resume": resume, "history_dir": history_dir,
@@ -101,7 +101,7 @@ class FakeBackend:
         log = [{"step": i + 1, "reward": 0.2 + 0.06 * i, "rewards/correct/mean": 0.2 + 0.06 * i, "loss": 0.1} for i in range(10)]
         return TrainOutput({"train/loss": 0.1}, log)
 
-    def evaluate_loss(self, model, tokenizer, texts, config, *, responses_only=None):
+    def evaluate_loss(self, model, tokenizer, texts, config, *, responses_only=None, conversations=None):
         self.calls.append(("evaluate_loss", {"model": model.name, "texts": list(texts), "responses_only": responses_only}))
         return {"eval/loss": self._loss(model), "eval/runtime": 1.0}
 

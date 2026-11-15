@@ -245,6 +245,7 @@ def grpo_config_kwargs(
     template_kwargs: dict[str, Any] | None = None,
     run_name: str | None = None,
     bf16: bool | None = None,
+    num_processes: int = 1,
 ) -> dict[str, Any]:
     """Keyword arguments of TRL's `GRPOConfig`.
 
@@ -259,11 +260,11 @@ def grpo_config_kwargs(
         raise ValueError("importance_sampling_level is token (GRPO) or sequence (GSPO)")
     if num_generations < 2:
         raise ValueError("num_generations must be at least 2: the advantage compares completions of one prompt")
-    step = train.per_device_train_batch_size * train.gradient_accumulation_steps
+    step = train.per_device_train_batch_size * train.gradient_accumulation_steps * num_processes
     if step % num_generations:
         raise ValueError(
-            f"per_device_train_batch_size * gradient_accumulation_steps = {step} must be a multiple of "
-            f"num_generations = {num_generations}: a step holds whole groups of completions"
+            f"per_device_train_batch_size * gradient_accumulation_steps * processes = {step} must be a multiple "
+            f"of num_generations = {num_generations}: a step holds whole groups of completions"
         )
     if not 0 < temperature < 10:
         raise ValueError("temperature must be above 0: without sampling every completion of a group is the same")
@@ -443,6 +444,8 @@ class UnslothBackend:
         responses_only: ResponsesOnly | None = None,
         resume: bool = True,
         history_dir: str | Path | None = None,
+        conversations: list[list[dict[str, str]]] | None = None,  # unused: Unsloth masks from the template
+        eval_conversations: list[list[dict[str, str]]] | None = None,
     ) -> TrainOutput:
         """Causal-LM training on rendered text: continued pretraining (`responses_only=None`) and
         chat fine-tuning (assistant turns only)."""
@@ -524,7 +527,7 @@ class UnslothBackend:
 
     def evaluate_loss(
         self, model, tokenizer, texts: list[str], config_kwargs: dict[str, Any], *,
-        responses_only: ResponsesOnly | None = None,
+        responses_only: ResponsesOnly | None = None, conversations: list[list[dict[str, str]]] | None = None,
     ) -> dict[str, float]:
         """Held-out loss of `texts`, with the same masking as training. TRL's trainer needs a train
         set to be constructed, so it is handed the eval rows; nothing is trained."""
@@ -573,6 +576,8 @@ class UnslothBackend:
 
     def count_tokens(self, tokenizer, texts: list[str]) -> list[int]:
         """Token counts of already-rendered texts (the template wrote the special tokens)."""
+        if not texts:
+            return []
         return [len(ids) for ids in tokenizer(list(texts), add_special_tokens=False)["input_ids"]]
 
     # ----------------------------------------------------------------- saving
@@ -610,17 +615,32 @@ class UnslothBackend:
             model.push_to_hub_merged(repo_id, tokenizer, save_method=method, private=private)
 
 
-_BACKEND: Any = None
+BACKENDS = ("unsloth", "hf")
+_INSTANCES: dict[str, Any] = {}
+_OVERRIDE: Any = None
 
 
-def get_backend():
-    global _BACKEND
-    if _BACKEND is None:
-        _BACKEND = UnslothBackend()
-    return _BACKEND
+def get_backend(name: str = "unsloth"):
+    """The backend a stage asked for with `backend:`.
+
+        unsloth   Unsloth's loaders, kernels, vLLM generation and GGUF export; needs a CUDA GPU
+        hf        plain transformers + PEFT + TRL + accelerate; runs anywhere, also on several GPUs
+    """
+    if _OVERRIDE is not None:
+        return _OVERRIDE
+    if name not in BACKENDS:
+        raise ValueError(f"backend must be one of {BACKENDS}, got {name!r}")
+    if name not in _INSTANCES:
+        if name == "hf":
+            from .hf import HfBackend
+
+            _INSTANCES[name] = HfBackend()
+        else:
+            _INSTANCES[name] = UnslothBackend()
+    return _INSTANCES[name]
 
 
 def set_backend(backend) -> None:
-    """Replace the backend (tests pass a fake; `None` restores Unsloth)."""
-    global _BACKEND
-    _BACKEND = backend
+    """Use `backend` whatever a stage asks for (tests pass a fake); `None` restores the real ones."""
+    global _OVERRIDE
+    _OVERRIDE = backend

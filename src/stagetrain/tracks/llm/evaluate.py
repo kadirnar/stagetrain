@@ -133,7 +133,7 @@ class Evaluate(Stage):
         rows = read_rows(p.eval_data, p.max_samples)
         if not rows:
             raise ValueError(f"{p.eval_data} holds no evaluation row")
-        backend = get_backend()
+        backend = get_backend(p.backend)
         model, tokenizer = backend.load(p.load_spec())
         if p.chat_template:
             tokenizer = backend.set_chat_template(tokenizer, p.chat_template)
@@ -148,7 +148,9 @@ class Evaluate(Stage):
             )
             masking = ResponsesOnly(p.instruction_part, p.response_part) if p.responses_only else None
             texts = render_chat(tokenizer, rows, p.chat_template_kwargs)
-            measured = backend.evaluate_loss(model, tokenizer, texts, config, responses_only=masking)
+            measured = backend.evaluate_loss(
+                model, tokenizer, texts, config, responses_only=masking, conversations=[r["messages"] for r in rows]
+            )
             if "eval/loss" in measured:
                 metrics["eval/loss"] = measured["eval/loss"]
                 if math.isfinite(measured["eval/loss"]):

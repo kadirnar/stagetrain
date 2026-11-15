@@ -76,7 +76,7 @@ class GenerateData(Stage):
         rows = [r for r in read_rows(p.data, p.max_samples) if len(r.get("messages") or []) >= 2]
         if not rows:
             raise ValueError(f"{p.data} holds no conversation with a prompt and a reference answer")
-        backend = get_backend()
+        backend = get_backend(p.backend)
         model, tokenizer = backend.load(p.load_spec())
         if p.chat_template:
             tokenizer = backend.set_chat_template(tokenizer, p.chat_template)

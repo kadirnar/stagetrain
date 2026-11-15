@@ -6,7 +6,7 @@ runs stages in order, resumes finished ones and stops at a failed quality gate.
 
 | Track | Model | Trained with | Stages | Design |
 |---|---|---|---|---|
-| `llm` | Generative LLM (LoRA / QLoRA) | [Unsloth](https://github.com/unslothai/unsloth), TRL | prepare_data → eval (baselines) → sft × N → select → select_checkpoint → generate_data → dpo / grpo → eval → export | [docs/llm.md](docs/llm.md), [research](docs/research/llm.md) |
+| `llm` | Generative LLM (LoRA / QLoRA / full) | [Unsloth](https://github.com/unslothai/unsloth), or plain TRL + PEFT; Axolotl and ms-swift through their CLIs; one or several GPUs | prepare_data → check_data → eval (baselines) → sft × N → select → select_checkpoint → generate_data → dpo / grpo → eval → export | [docs/llm.md](docs/llm.md); research: [training](docs/research/llm.md), [data quality](docs/research/llm-data.md), [libraries](docs/research/llm-libraries.md) |
 | `decision` | Decision model in the style of [LiquidAI/d1](https://huggingface.co/LiquidAI/d1-3B): typed answers in one forward pass, no generated tokens | transformers, PEFT | build_data (with held-out sources) → train × seeds → soup → calibrate → eval → export | [docs/decision.md](docs/decision.md), [research](docs/research/decision.md) |
 | `classifiers` | Encoder text classifier, single- or multi-label | transformers | prepare_data → baseline (TF-IDF) → mlm_adapt → finetune × (model, learning rate, seed) → select → calibrate → eval → export; label audit and ensemble distillation as a second recipe | [docs/classifiers.md](docs/classifiers.md), [research](docs/research/classifiers.md) |
 | `embeddings` | Text embedding model (bi-encoder) | sentence-transformers | prepare_data → bm25 and untuned baselines → mine_negatives (strong embedder) → finetune × N → select → merge → eval → export | [docs/embeddings.md](docs/embeddings.md), [research](docs/research/embeddings.md) |
@@ -117,6 +117,8 @@ Example configs:
 
 | Track | Config | What it trains |
 |---|---|---|
+| llm | `configs/llm/multi-gpu.yaml` | LoRA SFT on four GPUs without Unsloth; full fine-tuning with FSDP2 |
+| llm | `configs/llm/other-trainers.yaml` | the same data through Axolotl and ms-swift |
 | llm | `configs/llm/accuracy.yaml` | the research-driven recipe: baselines, a learning-rate sweep, checkpoint selection, self-play, GRPO, paired evaluations |
 | llm | `configs/llm/qwen3-multistage.yaml` | CPT, two SFT passes, DPO, eval, export |
 | llm | `configs/llm/sft-only.yaml` | the shortest useful pipeline |
@@ -155,6 +157,10 @@ gate:
   - {metric: eval/ece, max: 0.05}
 ```
 
+**Several GPUs.** A training stage of the llm track can be given `launch: {num_processes: 4}`. The
+pipeline stays one process: it starts that stage under `torchrun` (or `accelerate launch`) with one
+process per GPU and reads its result back. See [docs/llm.md](docs/llm.md#several-gpus).
+
 ## Adding a stage
 
 ```python
@@ -187,12 +193,14 @@ src/stagetrain/
                    manifests, run selection, training history, the HTML report, data sources,
                    shared training arguments, checkpoint averaging
   tracks/
-    llm/           Unsloth backend, data normalisation, scorers and rewards, cpt / sft / dpo / grpo,
-                   checkpoint selection, data generation, eval, export
+    llm/           Unsloth and hf backends, data normalisation and quality checks, scorers and rewards,
+                   cpt / sft / dpo / grpo, checkpoint selection, data generation, eval, export,
+                   Axolotl and ms-swift stages
     decision/      question schema, prompt and verbalizer, answer-slot loss, soup, calibration, probes
     classifiers/   label maps, MLM adaptation, fine-tuning, pseudo-labelling, calibration, export
     embeddings/    pair cleaning, contrastive training, hard-negative mining, retrieval eval, export
   cli.py
+  worker.py        one process of a stage launched on several GPUs
 configs/<track>/   example pipelines
 docs/<track>.md    the design of each track
 docs/research/     the evidence behind a track's recipe
@@ -201,7 +209,7 @@ tests/
 
 ## What has been verified
 
-The test suite (246 tests) runs on CPU in under a minute and downloads nothing:
+The test suite (274 tests) runs on CPU in under a minute and downloads nothing:
 
 ```bash
 pip install -e ".[decision,classifiers,embeddings,dev]"
@@ -213,15 +221,17 @@ pytest
   in a browser, in light and dark mode, with simulated curves.
 - **decision, classifiers, embeddings**: the real stages run end to end on tiny random models
   built inside the tests, through the same `Pipeline` a real run uses.
-- **llm**: Unsloth was not run where this was written. Its calls sit behind one backend module,
-  written against the Unsloth and TRL source, and the tests drive the stages (including the
-  whole accuracy pipeline with GRPO) through a stand-in backend. The scorers, statistics and
-  reward functions are tested directly, and the SFT, DPO and GRPO settings build real TRL
-  config objects. See [docs/llm.md](docs/llm.md) for what that leaves unchecked.
+- **llm**: the stages run end to end on a tiny random model with the `hf` backend (transformers,
+  PEFT and TRL): SFT, checkpoint selection, self-play, GRPO, export, and a stage in a worker
+  process. The Unsloth backend was not run: its calls were written against the Unsloth source and
+  are driven in the tests through a stand-in. `llm.axolotl` and `llm.swift` are tested against a
+  script standing in for those commands. The data checks are tested on rows with known defects.
+  See [docs/llm.md](docs/llm.md) for what that leaves unchecked.
 
 Not verified: no real checkpoint has been trained with these pipelines. The example configs are
 validated (`stagetrain plan`) and their dataset and model ids were checked against the Hub, but
 their hyperparameters and gate thresholds are starting points, not results.
 
-One pipeline is one process. Multi-GPU training through `accelerate launch` or `torchrun` is not
-wired up: every rank would run the whole pipeline.
+Training on several GPUs is wired up for the llm track and was not run on more than one process:
+this was written on a machine without a CUDA device. The other three tracks train in the
+pipeline's own process, on one GPU.

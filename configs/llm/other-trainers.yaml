@@ -1,0 +1,71 @@
+# The same data through two other training libraries, each on several GPUs: Axolotl and ms-swift.
+# Each stage writes the library's own config, runs its command, and brings back the adapter and
+# the training log, so the evaluation after it is the pipeline's own and the three compare.
+#
+#   stagetrain plan configs/llm/other-trainers.yaml
+#   stagetrain run  configs/llm/other-trainers.yaml
+#
+# Each library pins its own versions of transformers and torch: install it in an environment of
+# its own and point `executable` at its command. The generated config is in <stage>/config.yaml;
+# keys under `config:` are written as they are and win over the generated ones.
+#
+# Neither library was run when this was written: see docs/research/llm-libraries.md.
+
+track: llm
+name: qwen3-4b-other-trainers
+seed: 3407
+
+vars:
+  base_model: Qwen/Qwen3-4B
+  gpus: 4
+  training: &training
+    init_from: Qwen/Qwen3-4B
+    train_data: ${data.chat_train}
+    eval_data: ${data.chat_eval}
+    max_seq_length: 2048
+    lora: {r: 64, alpha: 32}
+    num_processes: 4
+    train: {learning_rate: 2.0e-4, num_train_epochs: 3, per_device_train_batch_size: 4, gradient_accumulation_steps: 1}
+  judge: &judge
+    backend: hf
+    max_seq_length: 2048
+    load_in: 16bit
+    eval_data: ${data.chat_test}
+    scorer: {name: contains}
+    measure_loss: false
+
+stages:
+  - name: data
+    kind: llm.prepare_data
+    params:
+      chat:
+        - source: {path: data/domain_chat.jsonl}
+      eval_fraction: 0.05
+      test_fraction: 0.1
+
+  - name: eval_base
+    kind: llm.eval
+    params: {<<: *judge, init_from: "${vars.base_model}"}
+
+  # Axolotl: DDP by default; FSDP2, DeepSpeed and quantisation-aware training through `config`.
+  - name: sft_axolotl
+    kind: llm.axolotl
+    params:
+      <<: *training
+      executable: [/opt/axolotl/bin/axolotl]
+      config: {sample_packing: true}
+
+  - name: eval_axolotl
+    kind: llm.eval
+    params: {<<: *judge, init_from: "${sft_axolotl.model}", compare_to: "${eval_base.scores}"}
+
+  # ms-swift: the widest list of methods; `swift rlhf` adds DPO, and its GRPO family through `config`.
+  - name: sft_swift
+    kind: llm.swift
+    params:
+      <<: *training
+      executable: [/opt/swift/bin/swift]
+
+  - name: eval_swift
+    kind: llm.eval
+    params: {<<: *judge, init_from: "${sft_swift.model}", compare_to: "${eval_base.scores}"}

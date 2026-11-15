@@ -2,7 +2,7 @@
 # pays for itself, in the order it pays.
 #
 #   data ─┬─> eval_base ──> eval_prompted           what the untuned model reaches, also with a better prompt
-#         └─> sft x5 (learning-rate sweep) ──> best_lr ──> pick (checkpoint by task metric) ──> eval_sft
+#         └─> quality (drop / flag bad rows) ──> sft x5 (learning-rate sweep) ──> best_lr ──> pick ──> eval_sft
 #                                                    └──> rl_init ──> selfplay ──> grpo ──> eval_grpo ──> export
 #
 #   stagetrain plan   configs/llm/accuracy.yaml
@@ -60,6 +60,20 @@ stages:
       test_fraction: 0.12
       max_eval: 1000
 
+  # Data quality: rows that are certainly useless are dropped (empty, looping, echoing the prompt,
+  # carrying control tokens, repeating a held-out question, or with a reference answer the scorer
+  # cannot check); everything else that looks wrong is listed in flags.jsonl for a person.
+  - name: quality
+    kind: llm.check_data
+    params:
+      chat: ${data.chat_train}
+      held_out: ["${data.chat_eval}", "${data.chat_test}"]
+      scorer: {name: numeric}
+      max_seq_length: 1024
+    gate:
+      - {metric: quality/chat_drop_rate, max: 0.3}     # above this the source is broken, not the rows
+      - {metric: quality/chat_conflict, max: 0.05}     # the same question with different answers
+
   # 2. The bar. Fine-tuning is credited only with what it adds over the base model given a good
   #    prompt, measured with the same scorer, the same decoding and the same questions.
   - name: eval_base
@@ -84,7 +98,7 @@ stages:
       train.learning_rate: [5.0e-5, 1.0e-4, 2.0e-4, 5.0e-4, 1.0e-3]
     params:
       init_from: ${vars.base_model}
-      train_data: ${data.chat_train}
+      train_data: ${quality.chat}
       eval_data: ${data.chat_eval}
       lora: {r: 64, alpha: 32}
       train: {num_train_epochs: 3, per_device_train_batch_size: 4, gradient_accumulation_steps: 4, warmup: 0.05}
@@ -121,7 +135,7 @@ stages:
     params:
       <<: *generation
       init_from: ${rl_init.model}
-      data: ${data.chat_train}
+      data: ${quality.chat}
       max_samples: 1000
       samples_per_prompt: 8
       temperature: 0.8
@@ -147,7 +161,7 @@ stages:
     params:
       <<: *training
       init_from: ${rl_init.model}
-      train_data: ${data.chat_train}
+      train_data: ${quality.chat}
       rewards:
         - {kind: correct, scorer: {name: numeric}, weight: 1.0}
         - {kind: format, pattern: '####\s*-?[\d,.]+\s*$', weight: 0.1}
