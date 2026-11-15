@@ -33,15 +33,15 @@ result.
 | # | Intervention | Evidence | What the pipeline does |
 |---|---|---|---|
 | 1 | **Trustworthy evaluation first.** Splits by question, a task metric, the same harness for the base model and a prompt-only baseline, paired statistics, 500 to 1,000 items | [C] Format and extraction artefacts of 4 to 50 points are documented; a 3B base model scored 62.9 % with flexible extraction and 10.7 % with strict matching (2603.19335) | `llm.prepare_data` splits by question into train / validation / test. `llm.eval` reports a scorer's mean with its standard error, compares item by item against another evaluation (`compare_to`), and runs few-shot and system-prompt baselines |
-| 2 | **Sweep the learning rate.** 4 to 6 values across 5e-5 to 1e-3 for LoRA; full fine-tuning 10 to 30 times lower | [C] The most sensitive setting. A wrong value costs about 10 points; the optimum moves with model, rank and batch size (2602.04998, 2609.01244) | `matrix:` on a stage runs it once per value; `llm.select` keeps the best run |
+| 2 | **Sweep the learning rate.** 4 to 6 values across 5e-5 to 1e-3 for LoRA; full fine-tuning 10 to 30 times lower | [C] The most sensitive setting. A wrong value costs about 10 points; the optimum moves with model, rank and batch size (2602.04998, 2609.01244) | `matrix:` on a stage runs it once per value; `llm.select` keeps the best run. The effective batch size is the second axis, and most other optimisation settings are not worth a sweep: [llm-optimizer.md](llm-optimizer.md) |
 | 3 | **Free configuration choices.** All linear layers, rank 32 to 64, loss on assistant tokens only, cosine decay, no truncated targets, the exact chat template | [C] Attention-only adapters and ranks 8 to 16 are measurably worse; cosine beats a constant rate (2609.01244, Thinking Machines "LoRA Without Regret") | These are the defaults. Rows longer than `max_seq_length` are dropped instead of cut |
 | 4 | **Data quality, then more verified examples.** Consistent targets first; then fresh examples, including teacher-generated ones that pass a check | [C] Tripling fresh examples from 5k to 15k lowered validation loss by a median 14 % (2609.01244). Synthetic task data from a stronger teacher is among the most reliable sources (2410.18588, 2508.04063) | `llm.generate_data` samples answers from any model and keeps the ones the scorer accepts |
 | 5 | **Choose the checkpoint by the task metric,** over 2 to 3 epochs or more | [C] Validation loss bottoms out near epoch 2 and rises afterwards while judged quality holds or improves (2609.01244, 2602.11149) | `llm.sft` keeps a checkpoint per epoch; `llm.select_checkpoint` answers the validation questions with each and keeps the best |
 | 6 | **A larger or better base model,** when inference cost allows | [C] In the one controlled comparison, scale mattered about five times more than the training method (2603.19335) | Not a pipeline step: `vars.base_model` |
 | 7 | **Reasoning traces that were generated blind and checked.** For students of 3B or less, mix long and short traces about 1:4 | [C] Traces written toward a shown answer pass a correctness filter and still cost about 16 points on MATH-500 (2607.14552); the 1:4 mix gave Qwen2.5-3B 7 to 8 points (2502.12143) | `llm.generate_data` never shows the reference to the model; `require_reasoning` keeps only answers with a valid reasoning block |
 | 8 | **Mix in 1 to 10 % general data** when general ability must survive | [C] 1 % prevented forgetting, measured for full fine-tuning only (2502.06042) | `replay_ratio` on a chat source |
-| 9 | **Post-training after SFT.** GRPO-family RL when answers can be checked and the model already solves part of the prompts; DPO at 7B and above | [C], single study: at 1.5B, GRPO-style +3.6 points over SFT while DPO was 5 points below it; at 7B, DPO +7.5 and SimPO +9.4 over SFT (2603.19335) | `llm.grpo`, `llm.dpo`; `llm.generate_data` reports whether the precondition holds and builds the DPO pairs |
-| 10 | **Several seeds,** then averaging or ensembling | [C]/[A] Typically 1 to 2 points for N times the cost. Seeds are needed anyway to trust a difference under about 2 points (SFT at 1.5B varied by 0.6 points, DPO at 3B by 2.0) | `seed` is a `matrix` key. Adapter averaging is not implemented |
+| 9 | **Post-training after SFT.** GRPO-family RL when answers can be checked and the model already solves part of the prompts; a preference stage at about 4B and above. Studied on its own in [llm-rl.md](llm-rl.md) | [C], single study: at 1.5B, GRPO-style +3.6 points over SFT while DPO was 5 points below it (2603.19335). The same study's "DPO at 7B and above" result (+7.5 over SFT) is single LoRA runs with no RL arm and is unverified; Tulu 3 and Olmo 3 give independent support for a preference stage at 7B to 8B | `llm.grpo`, `llm.dpo`, `llm.distill`; `llm.generate_data` reports whether the precondition holds, selects the prompts for RL and builds the DPO pairs |
+| 10 | **Several seeds,** then averaging or ensembling | [C]/[A] Typically 1 to 2 points for N times the cost. Seeds are needed anyway to trust a difference under about 2 points (SFT at 1.5B varied by 0.6 points, DPO at 3B by 2.0) | `seed` is a `matrix` key; `llm.soup` averages the seeds of one configuration into one adapter (+2.6 and +3.3 points on GSM8K in the one study that isolated it, see [llm-levers.md](llm-levers.md)) |
 
 ## What the evidence does not support
 
@@ -58,7 +58,8 @@ These are common and the pipeline leaves them out or off by default.
 - **NEFTune for task accuracy.** Its gains are on judged chat quality; benchmark accuracy is
   unchanged by the authors' own account (2310.05914).
 - **DPO variants.** None of 20 beat vanilla DPO after correction for multiple comparisons
-  (2603.19335). And at 1.5B every preference method scored below plain SFT.
+  (2603.19335). And at 1.5B every preference method scored below plain SFT. The one exception
+  with independent evidence is length-normalised DPO (Tulu 3), `loss_type: sigmoid_norm`.
 - **TIES / DARE merging to raise single-task accuracy.** Only plain task arithmetic reliably
   improved anything across four model families (2511.21437).
 - **One universal alpha rule.** `alpha = 2r`, `alpha = 32` fixed and very large alphas each win
@@ -78,7 +79,9 @@ These are common and the pipeline leaves them out or off by default.
 **Preference optimisation (DPO).** Needs pairs of a better and a worse answer to the same prompt.
 Self-generated pairs (a right and a wrong answer of the model itself) are what the controlled
 study used. Known failure: the loss falls while the probability of the preferred answer also
-falls (2410.08847). Use it at 7B and above, when SFT on gold answers has stopped helping.
+falls (2410.08847). Use it at about 4B and above, when SFT on gold answers has stopped helping;
+the evidence for where it helps is thinner than this document first said (see
+[llm-rl.md](llm-rl.md)).
 
 **Reinforcement learning with verifiable rewards.** GRPO samples several completions per prompt,
 scores them, and raises the probability of the better ones. Variants are settings of one trainer:
@@ -89,7 +92,11 @@ scores them, and raises the probability of the better ones. Variants are setting
 | `loss_type: dr_grpo` | Removes the length bias another way; also turns reward scaling off |
 | `loss_type: bnpo`, `grpo` | Unsloth's previous default, and the original objective |
 | `loss_type: cispo` | Clipped importance sampling; reported best at large scale in one study, collapsed in another |
-| `importance_sampling_level: sequence` | GSPO: one importance ratio per sequence. More stable, especially for mixture-of-experts models |
+| `loss_type: grpo` with `importance_sampling_level: sequence` | GSPO: one importance ratio per sequence. More stable, especially for mixture-of-experts models |
+
+At this scale the choice among them is inside the noise between seeds; what matters more is in
+[llm-rl.md](llm-rl.md): the prompts RL is run on, the number of prompts per update, the learning
+rate, and the reward.
 
 What it needs and where it fails:
 
@@ -116,8 +123,8 @@ Read from the release's source and documentation, not from a run.
   explicitly.
 - **Modes.** 4-bit QLoRA, 16-bit LoRA, 8-bit, full fine-tuning, FP8, QAT, DoRA, rsLoRA, LoftQ.
   Unsloth's documentation recommends 16-bit LoRA when maximum accuracy is the goal.
-- **Multi-GPU.** DDP works under `torchrun` or `accelerate launch`. This repository's pipeline
-  is a single process and does not launch it.
+- **Multi-GPU.** DDP works under `torchrun` or `accelerate launch`; a stage's `launch` block
+  starts it that way.
 - **Version pins.** `transformers<=5.17`, `trl<=1.15`, `datasets<5`, `torch<2.15`. The fields of
   `GRPOConfig` and `DPOConfig` are the same in trl 1.15 and 1.18, against which this
   repository's keyword arguments were checked.

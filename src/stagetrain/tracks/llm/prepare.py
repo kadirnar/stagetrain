@@ -73,6 +73,9 @@ class PrepareParams(StageParams):
     # A second held-out split that nothing is selected on, for the number that gets reported.
     # Choosing the best of many checkpoints on one split makes that split's score optimistic.
     test_fraction: float = Field(default=0.0, ge=0.0, le=0.5)
+    # Questions set aside for reinforcement learning, which no SFT or distillation stage trains on.
+    # RL on questions the model has already been fine-tuned on has less left to learn.
+    rl_fraction: float = Field(default=0.0, ge=0.0, le=0.9)
     max_eval: int | None = 1000
     min_chars: int = 1  # rows shorter or longer than this, counted over message contents, are dropped
     max_chars: int | None = None
@@ -152,6 +155,9 @@ class PrepareData(Stage):
             key = question_key if kind == "chat" else row_key
             train, test = split_rows(collector.rows, p.test_fraction, p.max_eval, seed + 1, key=key)
             train, held_out = split_rows(train, p.eval_fraction, p.max_eval, seed, key=key)
+            reserved: list[dict[str, Any]] = []
+            if kind == "chat" and p.rl_fraction > 0:  # before the replay rows join: RL gets task questions only
+                train, reserved = split_rows(train, p.rl_fraction, None, seed + 2, key=key)
             replayed = 0
             for src in sources:
                 if src in task_sources:
@@ -164,6 +170,8 @@ class PrepareData(Stage):
             if replayed:
                 random.Random(seed).shuffle(train)
             parts = {"train": train, "eval": held_out}
+            if reserved:
+                parts["rl"] = reserved
             if p.test_fraction > 0:
                 parts["test"] = test
             for part, rows in parts.items():

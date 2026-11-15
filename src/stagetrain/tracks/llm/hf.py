@@ -29,7 +29,7 @@ from .backend import (
 )
 
 # What `sft_config_kwargs` adds for TRL's SFTConfig; this backend trains text with `Trainer`.
-SFT_ONLY = ("dataset_text_field", "max_length", "packing", "embedding_learning_rate")
+SFT_ONLY = ("dataset_text_field", "max_length", "packing", "embedding_learning_rate", "loraplus_lr_ratio")
 EMBEDDING_PARAMETERS = ("embed_tokens", "lm_head")
 
 
@@ -308,7 +308,24 @@ class HfBackend:
         groups = [{"params": rest, "lr": args.learning_rate}]
         if slow:
             groups.append({"params": slow, "lr": embedding_learning_rate})
-        return torch.optim.AdamW(groups, lr=args.learning_rate, weight_decay=args.weight_decay)
+        return torch.optim.AdamW(
+            groups, lr=args.learning_rate, weight_decay=args.weight_decay,
+            betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_epsilon,
+        )
+
+    @staticmethod
+    def _loraplus_optimizer(model, args, ratio: float):
+        """LoRA+: AdamW with the B matrices at `ratio` times the learning rate of the A matrices."""
+        import torch
+        from peft import PeftModel
+        from peft.optimizers import create_loraplus_optimizer
+
+        if not isinstance(model, PeftModel):
+            raise ValueError("loraplus_lr_ratio needs a LoRA adapter; this stage trains every weight")
+        return create_loraplus_optimizer(
+            model, torch.optim.AdamW, lr=args.learning_rate, loraplus_lr_ratio=ratio,
+            loraplus_weight_decay=args.weight_decay, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_epsilon,
+        )
 
     def _text_trainer(
         self, model, tokenizer, train_texts, eval_texts, config_kwargs, responses_only, history_dir=None,
@@ -328,7 +345,9 @@ class HfBackend:
         if not len(train):
             raise ValueError("no training row is left after tokenisation")
         optimizers: tuple[Any, Any] = (None, None)
-        if embedding_lr is not None:
+        if config_kwargs.get("loraplus_lr_ratio") is not None:
+            optimizers = (self._loraplus_optimizer(model, args, config_kwargs["loraplus_lr_ratio"]), None)
+        elif embedding_lr is not None:
             optimizers = (self._embedding_optimizer(model, args, embedding_lr), None)
         return Trainer(
             model=model, args=args, train_dataset=train, eval_dataset=evaluation if len(evaluation) else None,
@@ -380,6 +399,23 @@ class HfBackend:
             model=model, processing_class=tokenizer, reward_funcs=list(reward_funcs),
             args=self._arguments(config_kwargs, GRPOConfig), train_dataset=Dataset.from_list(list(rows)),
             callbacks=self._callbacks(history_dir),
+        )
+        return self._fit(trainer, config_kwargs["output_dir"], False, resume)
+
+    def train_distill(
+        self, model, tokenizer, rows: list[dict[str, Any]], config_kwargs: dict[str, Any], *,
+        resume: bool = True, history_dir: str | Path | None = None,
+    ) -> TrainOutput:
+        """On-policy distillation from a teacher's logits (TRL's `DistillationTrainer`)."""
+        self._prepare()
+        from datasets import Dataset
+        from trl import DistillationConfig, DistillationTrainer
+
+        trainer = DistillationTrainer(
+            model=model, processing_class=tokenizer, args=self._arguments(config_kwargs, DistillationConfig),
+            # The trainer loads the teacher from this argument; the config field alone is not read.
+            teacher_model=config_kwargs["teacher_model_name_or_path"],
+            train_dataset=Dataset.from_list(list(rows)), callbacks=self._callbacks(history_dir),
         )
         return self._fit(trainer, config_kwargs["output_dir"], False, resume)
 

@@ -1,0 +1,187 @@
+# Post-training after SFT, in the order the published small-model recipes use: learn from a
+# teacher, then from the model's own verified answers, and reinforcement learning last, on
+# questions nothing before it trained on. Every step is optional and gated.
+#
+#   data ──> sft ──> distill ──> selfplay_1 ──> sft_1 ──> selfplay_2 ──> sft_2
+#                                                                          └─> rl_prompts ──> grpo ──> rl_prompts_2 ──> grpo_2 ──> eval
+#
+#   stagetrain plan   configs/llm/post-training.yaml
+#   stagetrain run    configs/llm/post-training.yaml
+#   stagetrain report configs/llm/post-training.yaml --open
+#
+# Why each step is here, and what was left out, is in docs/research/llm-rl.md. The numbers in this
+# file are starting points taken from papers, not results measured with this pipeline.
+
+track: llm
+name: qwen3-1.7b-post-training
+seed: 3407
+
+vars:
+  base_model: unsloth/Qwen3-1.7B
+  # The same family, so the same tokenizer. Point this at a model that was trained on the task
+  # (this pipeline run on the larger model first): in the one study that compared them, a larger
+  # model that was never trained on the task made the student worse than RL alone did.
+  teacher: unsloth/Qwen3-8B
+  generation: &generation
+    max_seq_length: 1024
+    load_in: 16bit
+    scorer: {name: numeric}
+    max_new_tokens: 400
+    chat_template_kwargs: {enable_thinking: false}
+  training: &training
+    max_seq_length: 1024
+    load_in: 16bit
+    chat_template_kwargs: {enable_thinking: false}
+  selfplay: &selfplay
+    <<: *generation
+    samples_per_prompt: 8
+    temperature: 0.8
+
+defaults:
+  llm.eval:
+    <<: *generation
+    eval_data: ${data.chat_test}
+    max_samples: 1000
+    measure_loss: false
+    samples_per_prompt: 8            # next to greedy accuracy: pass@8 and the majority vote
+
+stages:
+  - name: data
+    kind: llm.prepare_data
+    params:
+      chat:
+        - source: {path: openai/gsm8k, name: main, split: train, columns: {prompt: question, completion: answer}}
+          format: prompt_completion
+      eval_fraction: 0.05
+      test_fraction: 0.12
+      rl_fraction: 0.25              # questions no supervised stage sees: RL gains more on those
+
+  - name: quality
+    kind: llm.check_data
+    params:
+      chat: ${data.chat_train}
+      held_out: ["${data.chat_eval}", "${data.chat_test}"]
+      scorer: {name: numeric}
+
+  - name: sft
+    kind: llm.sft
+    params:
+      <<: *training
+      init_from: ${vars.base_model}
+      train_data: ${quality.chat}
+      eval_data: ${data.chat_eval}
+      lora: {r: 64, alpha: 32}
+
+  - name: eval_sft
+    kind: llm.eval
+    params: {init_from: "${sft.model}"}
+
+  # 1. On-policy distillation: the student answers the questions itself and is pulled toward the
+  #    teacher's next-token distribution on its own answers. No labels are used. With a teacher
+  #    that is good at the task, this had the best gain per GPU hour of anything compared.
+  - name: distill
+    kind: llm.distill
+    params:
+      <<: *training
+      init_from: ${sft.model}
+      teacher: ${vars.teacher}
+      train_data: ${quality.chat}
+      max_completion_length: 400
+      train: {learning_rate: 1.0e-5, max_steps: 500}
+
+  - name: eval_distill
+    kind: llm.eval
+    params: {init_from: "${distill.model}", compare_to: "${eval_sft.scores}"}
+    gate: {metric: eval/delta, min: 0.0}       # a teacher that does not help stops the run here
+
+  # 2. Two rounds of learning from the model's own verified answers: sample eight answers per
+  #    question, keep two distinct right ones, fine-tune on them. Each round samples with the
+  #    newest model and trains from the checkpoint the rounds started at, on that round's answers
+  #    only. In the comparisons available this reached most of what GRPO reached, far cheaper.
+  #    It stops paying after two or three rounds; pass@k falling between rounds is the sign.
+  - name: selfplay_1
+    kind: llm.generate_data
+    params: {<<: *selfplay, init_from: "${distill.model}", data: "${quality.chat}", keep_per_prompt: 2}
+
+  - name: sft_1
+    kind: llm.sft
+    params:
+      <<: *training
+      init_from: ${distill.model}
+      train_data: ${selfplay_1.sft}
+      eval_data: ${data.chat_eval}
+      train: {learning_rate: 5.0e-5, num_train_epochs: 2}
+
+  - name: selfplay_2
+    kind: llm.generate_data
+    params: {<<: *selfplay, init_from: "${sft_1.model}", data: "${quality.chat}", keep_per_prompt: 2}
+    gate: {metric: generate/pass_at_k, baseline: selfplay_1.generate/pass_at_k, max_drop: 0.0}
+
+  - name: sft_2
+    kind: llm.sft
+    params:
+      <<: *training
+      init_from: ${distill.model}
+      train_data: ${selfplay_2.sft}
+      eval_data: ${data.chat_eval}
+      train: {learning_rate: 5.0e-5, num_train_epochs: 2}
+
+  # 3. Reinforcement learning, last, on the reserved questions, in two stages. Before each, the
+  #    questions are measured with the model that stage starts from, and only the ones it solves
+  #    sometimes are used (plus a tenth of the solved ones). The published recipes that filter
+  #    this way measure again between stages: a filter computed once goes stale as the model learns.
+  - name: rl_prompts
+    kind: llm.generate_data
+    params:
+      <<: *selfplay
+      init_from: ${sft_2.model}
+      data: ${data.chat_rl}
+      temperature: 1.0               # the temperature RL samples at
+      top_p: 1.0
+      audit_scorer: {name: contains}
+    gate:
+      - {metric: generate/mixed_fraction, min: 0.1}       # RL has something to work on
+      - {metric: generate/scorer_disagreement, max: 0.05}  # the reward does not punish right answers
+
+  - name: grpo
+    kind: llm.grpo
+    params:
+      <<: *training
+      init_from: ${sft_2.model}
+      train_data: ${rl_prompts.rl}
+      rewards:
+        - {kind: correct, scorer: {name: numeric}}
+      num_generations: 8
+      max_completion_length: 400
+      train: {max_steps: 250}
+    gate: {metric: train/reward_gain, min: 0.0}
+
+  - name: rl_prompts_2
+    kind: llm.generate_data
+    params:
+      <<: *selfplay
+      init_from: ${grpo.model}
+      data: ${data.chat_rl}
+      temperature: 1.0
+      top_p: 1.0
+    gate: {metric: generate/mixed_fraction, min: 0.05}
+
+  - name: grpo_2
+    kind: llm.grpo
+    params:
+      <<: *training
+      init_from: ${grpo.model}
+      train_data: ${rl_prompts_2.rl}
+      rewards:
+        - {kind: correct, scorer: {name: numeric}}
+      num_generations: 8
+      max_completion_length: 400
+      train: {max_steps: 250}
+
+  # 4. Against the SFT model, item by item. pass@8 and the majority vote are reported next to
+  #    the greedy score: a model that got better at one sample and worse under voting has been
+  #    sharpened, not improved.
+  - name: eval
+    kind: llm.eval
+    params: {init_from: "${grpo_2.model}", compare_to: "${eval_sft.scores}"}
+    gate: {metric: eval/delta_ci_low, min: 0.0}

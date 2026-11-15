@@ -126,6 +126,14 @@ def run(tmp_path_factory):
             "train": {**CPU, "per_device_train_batch_size": 4, "max_steps": 3, "save_steps": None, "learning_rate": 1e-5,
                       "logging_steps": 1}}},
         {"name": "export", "kind": "llm.export", "params": {**model, "init_from": "${grpo.model}", "formats": ["lora", "merged_16bit"]}},
+        # on-policy distillation: the untrained model learns from the fine-tuned one's logits, with no labels
+        {"name": "distill", "kind": "llm.distill", "params": {
+            **model, "init_from": str(base), "teacher": "${pick.model}", "full_finetuning": True,
+            "train_data": "${data.chat_train}", "max_completion_length": 4,
+            "train": {**CPU, "learning_rate": 3e-3, "max_steps": 150, "per_device_train_batch_size": 16,
+                      "gradient_accumulation_steps": 1, "save_steps": None, "logging_steps": 10}}},
+        {"name": "eval_distill", "kind": "llm.eval", "params": {
+            **judge, "init_from": "${distill.model}", "eval_data": "${data.chat_test}", "compare_to": "${eval_base.scores}"}},
     ]
     pipeline = Pipeline(build_config({"track": "llm", "name": "hf", "output_dir": str(tmp / "runs"), "seed": 3, "stages": stages}))
     pipeline.run()
@@ -180,6 +188,14 @@ def test_selfplay_and_grpo_run(run):
     assert 0.0 <= logged[0]["train/rewards/correct/mean"] <= 1.0
 
 
+def test_distillation_teaches_the_student_without_labels(run):
+    distill, after = run.manifest("distill"), run.manifest("eval_distill").metrics
+    assert distill.notes["teacher"].endswith("pick/model") and distill.notes["mode"] == "full"
+    assert distill.metrics["train/rows"] > 100 and load_history(run.run_dir / "distill")
+    # the student started as a random model (score 0) and saw no reference answer
+    assert after["eval/score"] >= 0.5 and after["eval/delta_ci_low"] > 0
+
+
 def test_export_and_a_second_run(run):
     export = run.manifest("export")
     assert is_adapter_dir(run.run_dir / "export" / "lora") and (run.run_dir / "export" / "merged_16bit" / "config.json").is_file()
@@ -208,10 +224,14 @@ def test_backend_choice_and_its_limits(tmp_path):
 
     with pytest.raises(PipelineError, match="needs backend: unsloth"):
         Pipeline(config(backend="hf", fast_inference=True)).validate()
-    # eight completions per prompt need a step of 8, 16, ...: four GPUs with a batch of 2 each fit
-    Pipeline(config(train={"per_device_train_batch_size": 2}, launch={"num_processes": 4})).validate()
+    # eight completions per prompt need a batch of rollouts of 8, 16, ...: four GPUs with 2 each fit
+    small = {"per_device_train_batch_size": 2, "gradient_accumulation_steps": 1}
+    Pipeline(config(train=small, launch={"num_processes": 4})).validate()
     with pytest.raises(PipelineError, match="processes = 6 must be a multiple"):
-        Pipeline(config(train={"per_device_train_batch_size": 2}, launch={"num_processes": 3})).validate()
+        Pipeline(config(train=small, launch={"num_processes": 3})).validate()
+    with pytest.raises(PipelineError, match="GSPO is loss_type: grpo"):
+        Pipeline(config(importance_sampling_level="sequence")).validate()
+    Pipeline(config(loss_type="grpo", importance_sampling_level="sequence", steps_per_generation=16, epsilon_high=0.28)).validate()
 
 
 def test_launch_commands():
@@ -257,3 +277,69 @@ def test_only_the_main_process_writes(tmp_path, monkeypatch):
     assert got.artifacts == {"model": str(tmp_path / "model")} and got.metrics == {"train/loss": 1.0} and got.notes == {"a": 1}
     with pytest.raises(RuntimeError, match="left no result.json"):
         read_result(tmp_path / "missing")
+
+
+# ------------------------------------------------------------- LoRA+, seeds and their soup
+
+
+def test_loraplus_gives_the_b_matrices_a_higher_learning_rate(tmp_path):
+    from types import SimpleNamespace
+
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    base = AutoModelForCausalLM.from_pretrained(str(build_model_dir(tmp_path / "base")))
+    model = get_peft_model(base, LoraConfig(task_type="CAUSAL_LM", r=4, target_modules=["q_proj", "v_proj"]))
+    args = SimpleNamespace(learning_rate=1e-4, weight_decay=0.01, adam_beta1=0.9, adam_beta2=0.95, adam_epsilon=1e-8)
+    optimizer = HfBackend._loraplus_optimizer(model, args, 16.0)
+    rates = {}
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            rates[id(param)] = group["lr"]
+    named = {name: rates[id(p)] for name, p in model.named_parameters() if p.requires_grad}
+    assert len(named) == 8 and optimizer.defaults["betas"] == (0.9, 0.95)
+    assert all(lr == pytest.approx(1e-4) for name, lr in named.items() if "lora_A" in name)
+    assert all(lr == pytest.approx(1.6e-3) for name, lr in named.items() if "lora_B" in name)
+    with pytest.raises(ValueError, match="needs a LoRA adapter"):
+        HfBackend._loraplus_optimizer(base, args, 16.0)
+
+
+def test_seeds_are_trained_with_loraplus_and_averaged_into_one_adapter(tmp_path):
+    base = build_model_dir(tmp_path / "base")
+    write_jsonl(tmp_path / "chat.jsonl", conversations(160))
+    model = {"backend": "hf", "max_seq_length": 48, "load_in": "16bit"}
+    judge = {**model, "max_new_tokens": 2, "measure_loss": False, "max_samples": 30, "eval_data": "${data.chat_eval}"}
+    p = Pipeline(build_config({
+        "track": "llm", "name": "seeds", "output_dir": str(tmp_path / "runs"),
+        "stages": [
+            {"name": "data", "kind": "llm.prepare_data", "params": {
+                "chat": [{"source": {"path": str(tmp_path / "chat.jsonl")}}], "eval_fraction": 0.25, "dedupe": False}},
+            {"name": "sft", "kind": "llm.sft", "matrix": {"seed": [1, 2]}, "params": {
+                **model, "init_from": str(base), "train_data": "${data.chat_train}", "eval_data": "${data.chat_eval}",
+                "lora": {"r": 4, "alpha": 8}, "loraplus_lr_ratio": 4,
+                "train": {**CPU, "learning_rate": 2e-3, "num_train_epochs": 2, "per_device_train_batch_size": 16,
+                          "gradient_accumulation_steps": 1, "adam_beta2": 0.95, "weight_decay": 0.0}}},
+            {"name": "best", "kind": "llm.select", "params": {"group": "sft", "metric": "eval/loss", "average_over": ["seed"]}},
+            {"name": "soup", "kind": "llm.soup", "params": {"group": "sft", "selected_by": "best"}},
+            {"name": "eval_single", "kind": "llm.eval", "params": {**judge, "init_from": "${best.model}"}},
+            {"name": "eval_soup", "kind": "llm.eval", "params": {
+                **judge, "init_from": "${soup.model}", "compare_to": "${eval_single.scores}", "measure_loss": True}},
+            {"name": "export", "kind": "llm.export", "params": {**model, "init_from": "${soup.model}", "formats": ["merged_16bit"]}},
+        ],
+    }))
+    p.run()
+    soup = p.manifest("soup")
+    assert soup.metrics == {"soup/members": 2.0, "soup/rank": 8.0}
+    assert is_adapter_dir(soup.artifact("model", p.run_dir))
+    after = p.manifest("eval_soup").metrics
+    assert after["eval/rows"] == 30 and after["eval/delta_n"] == 30 and after["eval/loss"] > 0
+    # The averaged adapter is an ordinary adapter: it loads on its base, evaluates, and merges for export.
+    singles = [p.manifest(f"sft-{i}").metrics["eval/loss"] for i in (1, 2)]
+    assert after["eval/loss"] < max(singles) + 0.5
+    assert os.path.exists(os.path.join(p.manifest("export").artifact("merged_16bit", p.run_dir), "config.json"))
+    with pytest.raises(Exception, match="backend: hf"):
+        Pipeline(build_config({"track": "llm", "name": "x", "output_dir": str(tmp_path), "stages": [
+            {"name": "sft", "kind": "llm.sft", "params": {"init_from": "m", "train_data": "d", "loraplus_lr_ratio": 16}}]})).validate()
+    with pytest.raises(Exception, match="applies to cpt and sft"):
+        Pipeline(build_config({"track": "llm", "name": "x", "output_dir": str(tmp_path), "stages": [
+            {"name": "dpo", "kind": "llm.dpo", "params": {"backend": "hf", "init_from": "m", "train_data": "d", "loraplus_lr_ratio": 16}}]})).validate()

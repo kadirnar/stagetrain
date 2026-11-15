@@ -42,6 +42,7 @@ from .backend import (
     SftTrainArgs,
     TrainOutput,
     adapter_trains_embeddings,
+    distill_config_kwargs,
     dpo_config_kwargs,
     get_backend,
     grpo_config_kwargs,
@@ -89,6 +90,10 @@ class TrainParams(ModelParams):
     lora: LlmLora = Field(default_factory=LlmLora)
     train: LlmTrainArgs = Field(default_factory=LlmTrainArgs)
     embedding_learning_rate: float | None = None  # for embed_tokens / lm_head when they are trained
+    # LoRA+: the B matrices train at this multiple of the learning rate (16 in the paper; lower
+    # the learning rate by about half with it). Off by default: with a tuned learning rate four
+    # groups measured anything from no gain to four points. cpt and sft, backend: hf.
+    loraplus_lr_ratio: float | None = Field(default=None, ge=1.0)
     resume: bool = True  # after an interruption, go on from this stage's last checkpoint
     # A row longer than max_seq_length is dropped, not cut: a cut row teaches an answer (or a
     # reasoning trace) that stops in the middle. `truncate` keeps the library's behaviour.
@@ -96,6 +101,15 @@ class TrainParams(ModelParams):
     # One process per GPU: {num_processes: 4}. The pipeline starts the stage under
     # `accelerate launch` (or torchrun) and reads its result back; see stagetrain.core.launch.
     launch: LaunchSpec = Field(default_factory=LaunchSpec)
+
+    @model_validator(mode="after")
+    def _loraplus(self) -> TrainParams:
+        if self.loraplus_lr_ratio is not None:
+            if self.backend != "hf":
+                raise ValueError("loraplus_lr_ratio needs backend: hf, which builds the optimizer itself")
+            if self.full_finetuning:
+                raise ValueError("loraplus_lr_ratio is a LoRA setting; this stage trains every weight")
+        return self
 
 
 class CptParams(TrainParams):
@@ -139,6 +153,8 @@ class DpoParams(TrainParams):
 
     @model_validator(mode="after")
     def _one_learning_rate(self) -> DpoParams:
+        if self.loraplus_lr_ratio is not None:
+            raise ValueError("loraplus_lr_ratio applies to cpt and sft")
         if self.embedding_learning_rate is not None:
             raise ValueError("embedding_learning_rate applies to cpt and sft; TRL's DPO trainer has one learning rate")
         return self
@@ -160,10 +176,26 @@ class GrpoParams(TrainParams):
     max_prompt_tokens: int | None = None  # longer prompts are dropped; None: max_seq_length - max_completion_length
     temperature: float = 1.0
     top_p: float = 1.0
-    loss_type: Literal["dapo", "grpo", "dr_grpo", "bnpo", "cispo"] = "dapo"
-    beta: float = 0.0  # KL penalty toward the starting policy; the current recipes run without it
-    importance_sampling_level: Literal["token", "sequence"] = "token"  # sequence is GSPO
+    # The objective. `dapo` is the default everywhere and nothing has displaced it: at 1B to 8B the
+    # objectives differ by less than the seed-to-seed noise. GSPO is `grpo` with
+    # importance_sampling_level: sequence.
+    loss_type: Literal["dapo", "grpo", "dr_grpo", "bnpo", "cispo", "sapo", "luspo", "vespo"] = "dapo"
+    beta: float = 0.0  # KL penalty toward the starting policy; most studies found it useless or harmful
+    importance_sampling_level: Literal["token", "sequence"] = "token"
     mask_truncated_completions: bool | None = None
+    # Reusing rollouts: generate for this many steps at once (a multiple of
+    # gradient_accumulation_steps) and/or pass over each batch `num_iterations` times. Cheaper per
+    # update, and the updates are then off-policy, which is where clipping (`epsilon`, and a
+    # looser `epsilon_high` for increases, 0.28 in DAPO) starts to matter.
+    steps_per_generation: int | None = None
+    num_iterations: int = Field(default=1, ge=1)
+    epsilon: float | None = None
+    epsilon_high: float | None = None
+    scale_rewards: Literal["group", "batch", "none"] | None = None  # None: the library's default (group)
+    # normalize_then_sum scales every reward term on its own before adding them (GDPO), so a
+    # term with a wide range does not drown the others.
+    multi_objective_aggregation: Literal["sum_then_normalize", "normalize_then_sum"] | None = None
+    cast_lm_head_to_fp32: bool = False  # steadier log-probabilities in long half-precision runs; needs untied embeddings
     fast_inference: bool = False  # generate with vLLM: much faster, LoRA on a 4bit or 16bit base only
     gpu_memory_utilization: float = 0.5
 
@@ -171,6 +203,8 @@ class GrpoParams(TrainParams):
     def _consistent(self) -> GrpoParams:
         if self.eval_data:
             raise ValueError("grpo takes no eval_data: measure the held-out reward with llm.eval, which decodes greedily")
+        if self.loraplus_lr_ratio is not None:
+            raise ValueError("loraplus_lr_ratio applies to cpt and sft")
         if self.embedding_learning_rate is not None:
             raise ValueError("embedding_learning_rate applies to cpt and sft")
         build_rewards(self.rewards)  # distinct names, importable custom functions
@@ -178,13 +212,21 @@ class GrpoParams(TrainParams):
             self.train, output_dir="unused", seed=0, num_generations=self.num_generations,
             max_completion_length=self.max_completion_length, temperature=self.temperature, top_p=self.top_p,
             loss_type=self.loss_type, beta=self.beta, importance_sampling_level=self.importance_sampling_level,
-            num_processes=self.launch.num_processes,
+            num_processes=self.launch.num_processes, **self.objective_settings(),
         )
         if self.fast_inference and self.backend != "unsloth":
             raise ValueError("fast_inference (vLLM generation) needs backend: unsloth")
         if self.max_completion_length >= self.max_seq_length:
             raise ValueError("max_completion_length must leave room for the prompt inside max_seq_length")
         return self
+
+    def objective_settings(self) -> dict[str, Any]:
+        return {
+            "steps_per_generation": self.steps_per_generation, "num_iterations": self.num_iterations,
+            "epsilon": self.epsilon, "epsilon_high": self.epsilon_high, "scale_rewards": self.scale_rewards,
+            "multi_objective_aggregation": self.multi_objective_aggregation,
+            "cast_lm_head_to_fp32": self.cast_lm_head_to_fp32,
+        }
 
     def load_spec(self, model_name: str | None = None) -> LoadSpec:
         return LoadSpec(
@@ -193,6 +235,35 @@ class GrpoParams(TrainParams):
             fast_inference=self.fast_inference, max_lora_rank=max(self.lora.r, 8),
             gpu_memory_utilization=self.gpu_memory_utilization,
         )
+
+
+class DistillParams(TrainParams):
+    """On-policy distillation: the student answers the training prompts itself and is pulled
+    toward the teacher's next-token distribution on its own answers.
+
+    The teacher must share the student's tokenizer (a larger model of the same family) and should
+    be good at the task: a teacher that was never trained on it can be worse than no teacher.
+    `train_data` is chat JSONL; only the prompts are used, so no reference answers are needed.
+    """
+
+    teacher: str  # a Hub id or a model directory
+    train: DpoTrainArgs = Field(default_factory=lambda: DpoTrainArgs(learning_rate=1e-5, max_steps=500))
+    beta: float = Field(default=1.0, ge=0.0, le=1.0)  # 0: forward KL, 0.5: Jensen-Shannon, 1: reverse KL
+    temperature: float = Field(default=1.0, gt=0.0)
+    max_completion_length: int = 512
+    max_prompt_tokens: int | None = None  # longer prompts are dropped; None: max_seq_length - max_completion_length
+
+    @model_validator(mode="after")
+    def _consistent(self) -> DistillParams:
+        if self.eval_data:
+            raise ValueError("distill takes no eval_data: measure the student with llm.eval")
+        if self.loraplus_lr_ratio is not None:
+            raise ValueError("loraplus_lr_ratio applies to cpt and sft")
+        if self.embedding_learning_rate is not None:
+            raise ValueError("embedding_learning_rate applies to cpt and sft")
+        if self.max_completion_length >= self.max_seq_length:
+            raise ValueError("max_completion_length must leave room for the prompt inside max_seq_length")
+        return self
 
 
 # --------------------------------------------------------------------------- #
@@ -356,6 +427,7 @@ def _text_stage(
         p.train, output_dir=stage_dir(ctx, "checkpoints"), seed=seed, has_eval=bool(eval_texts),
         max_seq_length=p.max_seq_length, run_name=f"{ctx.pipeline}-{ctx.stage}", packing=p.packing,
         embedding_learning_rate=embedding_lr(p, info["trains_embeddings"]), bf16=backend.bf16_supported(),
+        loraplus_lr_ratio=p.loraplus_lr_ratio,
     )
     out = backend.train_text(
         model, tokenizer, train_texts, eval_texts, config, responses_only=masking, resume=p.resume and ctx.resumed,
@@ -475,7 +547,7 @@ class ReinforcementLearning(LaunchableStage):
             loss_type=p.loss_type, beta=p.beta, importance_sampling_level=p.importance_sampling_level,
             reward_weights=weights, mask_truncated_completions=p.mask_truncated_completions,
             template_kwargs=p.chat_template_kwargs, run_name=f"{ctx.pipeline}-{ctx.stage}", bf16=backend.bf16_supported(),
-            num_processes=p.launch.num_processes,
+            num_processes=p.launch.num_processes, **p.objective_settings(),
         )
         out = backend.train_grpo(
             model, tokenizer, rows, functions, config, resume=p.resume and ctx.resumed, history_dir=ctx.out_dir
@@ -483,5 +555,40 @@ class ReinforcementLearning(LaunchableStage):
         result = finish(ctx, backend, model, tokenizer, out, info, {"train": len(rows)})
         if is_main_process():
             result.metrics.update(reward_trend(out.log_history))
+            result.metrics["train/dropped_overlength"] = float(len(chats) - len(rows))
+        return result
+
+
+@register("llm.distill")
+class Distill(LaunchableStage):
+    """On-policy distillation from a larger model of the same family (TRL's DistillationTrainer)."""
+
+    Params = DistillParams
+
+    def execute(self, ctx: StageContext) -> StageResult:
+        p: DistillParams = self.params
+        seed = self.seed(ctx)
+        seed_everything(seed)
+        chats = [r for r in read_rows(p.train_data, p.max_train_samples) if r.get("messages")]
+        if not chats:
+            raise ValueError(f"{p.train_data} holds no conversation")
+        backend = get_backend(p.backend)
+        model, tokenizer, info = prepare_model(p, ctx, seed)
+        limit = p.max_prompt_tokens or p.max_seq_length - p.max_completion_length
+        # The prompt is everything before the last assistant turn; a row without one is all prompt.
+        prompts = [r["messages"][:-1] if r["messages"][-1]["role"] == "assistant" else r["messages"] for r in chats]
+        keep = within_length(backend, tokenizer, [render_prompt(tokenizer, m, p.chat_template_kwargs) for m in prompts], limit)
+        rows = [{"prompt": m} for m, ok in zip(prompts, keep, strict=True) if ok and m]
+        if not rows:
+            raise ValueError(f"every prompt is longer than {limit} tokens")
+        config = distill_config_kwargs(
+            p.train, output_dir=stage_dir(ctx, "checkpoints"), seed=seed, teacher=p.teacher,
+            max_completion_length=p.max_completion_length, beta=p.beta, temperature=p.temperature,
+            template_kwargs=p.chat_template_kwargs, run_name=f"{ctx.pipeline}-{ctx.stage}", bf16=backend.bf16_supported(),
+        )
+        out = backend.train_distill(model, tokenizer, rows, config, resume=p.resume and ctx.resumed, history_dir=ctx.out_dir)
+        info["teacher"] = p.teacher
+        result = finish(ctx, backend, model, tokenizer, out, info, {"train": len(rows)})
+        if is_main_process():
             result.metrics["train/dropped_overlength"] = float(len(chats) - len(rows))
         return result

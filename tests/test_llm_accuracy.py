@@ -12,9 +12,9 @@ from stagetrain.core.history import load_history
 from stagetrain.core.report import report_data
 from stagetrain.tracks.llm import set_backend
 from stagetrain.tracks.llm.data import question_key
-from stagetrain.tracks.llm.evaluate import build_prompt, prompt_key
-from stagetrain.tracks.llm.generate import sort_answers
-from stagetrain.tracks.llm.scoring import build_scorer
+from stagetrain.tracks.llm.evaluate import build_prompt, prompt_key, sampled_metrics
+from stagetrain.tracks.llm.generate import nearest, rl_prompts, sort_answers
+from stagetrain.tracks.llm.scoring import ScorerSpec, build_scorer
 from stagetrain.tracks.llm.train import reward_trend
 
 pytest.importorskip("datasets")
@@ -144,7 +144,7 @@ def test_accuracy_pipeline(sources, backend):
     assert call["rewards"]["correct"][:4] == [1.0, 0.0, 1.0, 0.0] and set(call["rewards"]["reasoning"]) == {0.0}
     config = call["config"]
     assert config["num_generations"] == 4 and config["reward_weights"] == [1.0, 0.1] and config["loss_type"] == "dapo"
-    assert config["learning_rate"] == 5e-6 and config["max_steps"] == 50 and config["chat_template_kwargs"] == {"enable_thinking": False}
+    assert config["learning_rate"] == 1e-5 and config["max_steps"] == 50 and config["chat_template_kwargs"] == {"enable_thinking": False}
     grpo = m["grpo"].metrics
     assert grpo["train/reward_start"] == pytest.approx(0.2) and grpo["train/reward"] == pytest.approx(0.74)
     assert grpo["train/reward_gain"] == pytest.approx(0.54) and m["grpo"].notes["mode"] == "adapter:continue"
@@ -208,6 +208,55 @@ def test_bad_parameters_fail_before_anything_runs(sources, backend, stage, param
     with pytest.raises(PipelineError, match=message):
         pipeline(sources, **{stage: params}).validate()
     assert backend.calls == []
+
+
+def test_prompts_reserved_for_rl_are_not_trained_on_before(sources, backend):
+    p = pipeline(sources, data={"rl_fraction": 0.3})
+    m = p.run(only=["data"])[0]
+    run = p.run_dir / "data"
+    train = {question_key(r) for r in read_jsonl(run / "chat.train.jsonl")}
+    rl = [r for r in read_jsonl(run / "chat.rl.jsonl")]
+    assert m.metrics["chat/rl_rows"] == len(rl) > 20 and not train & {question_key(r) for r in rl}
+    assert not any(r["messages"][0]["content"].startswith("Do ") for r in rl)  # replay rows are not RL prompts
+    assert m.artifacts["chat_rl"] == "run://data/chat.rl.jsonl"
+
+
+def test_generated_data_for_rl_and_for_pairs(sources, backend):
+    # of every four prompts the fake model solves one always, two sometimes, one never
+    p = pipeline(sources, selfplay={"negatives": "nearest", "prefer": "shortest", "keep_per_prompt": 2,
+                                    "audit_scorer": {"name": "contains"}})
+    p.run(until="selfplay")
+    m = p.manifest("selfplay")
+    run = p.run_dir / "selfplay"
+    rated = list(read_jsonl(run / "prompts.jsonl"))
+    assert {round(r["pass_rate"], 2) for r in rated} == {0.0, 0.5, 1.0} and all(r["samples"] == 4 for r in rated)
+    rl = list(read_jsonl(run / "rl.jsonl"))
+    always = sum(r["pass_rate"] == 1.0 for r in rated)
+    sometimes = sum(0 < r["pass_rate"] < 0.9 for r in rated)
+    # the prompts solved sometimes, a tenth of those always solved, none of those never solved
+    assert len(rl) == sometimes + round(0.1 * always) == m.metrics["generate/rl_rows"]
+    assert "pass_rate" not in rl[0] and rl[0]["messages"][-1]["role"] == "assistant"  # ordinary chat rows for llm.grpo
+    assert m.metrics["generate/scorer_disagreement"] == 0.0  # nothing the task scorer rejects is accepted by the lenient one
+    assert rl_prompts(rated, low=0.0, high=1.0, keep_solved=0.0) == [r for r in rated if 0 < r["pass_rate"] < 1]
+    assert rl_prompts([], keep_solved=1.0) == []
+
+    assert nearest("the answer is 12", ["I think it is banana", "the answer is 13"]) == "the answer is 13"
+    judge = build_scorer()
+    right, _, _ = sort_answers(["<think>a long chain of reasoning</think> A", "<think>short</think> A"], "A", {}, judge)
+    assert sorted(right, key=len)[0] == "<think>short</think> A"
+
+
+def test_eval_can_sample_for_pass_at_k_and_majority_vote(sources, backend):
+    p = pipeline(sources, eval_base={"samples_per_prompt": 4})
+    m = p.run(until="eval_base")[1].metrics
+    # the fake model's samples: always right, sometimes right (twice), never right, by question
+    assert m["eval/pass_at_k"] == pytest.approx(0.75, abs=0.05) and m["eval/sampled_pass_at_1"] == pytest.approx(0.5, abs=0.05)
+    assert m["eval/pass_at_k"] >= m["eval/majority_vote"] >= 0.25
+    assert backend.of("sample")[0][2:] == (4, 0.8)
+    answers = [["<think>x</think> 4", "<think>y</think> 4", "5"], ["7", "8", "8"]]
+    rows = [{"messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": ref}]} for ref in ("4", "7")]
+    assert sampled_metrics(answers, rows, ScorerSpec()) == {
+        "eval/sampled_pass_at_1": 0.5, "eval/pass_at_k": 1.0, "eval/majority_vote": 0.5}
 
 
 def test_helpers():

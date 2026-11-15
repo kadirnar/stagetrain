@@ -25,6 +25,12 @@ class TrainArgs(BaseModel):
     lr_scheduler_type: str = "cosine"
     max_grad_norm: float = 1.0
     optim: str | None = None
+    # Adam's moments and epsilon, the library's defaults (0.9, 0.999, 1e-8) when unset. No
+    # fine-tuning study found a value that beats them; they are here to be set, not to be swept.
+    adam_beta1: float | None = Field(default=None, ge=0.0, lt=1.0)
+    adam_beta2: float | None = Field(default=None, ge=0.0, lt=1.0)
+    adam_epsilon: float | None = Field(default=None, gt=0.0)
+    lr_scheduler_kwargs: dict[str, Any] = Field(default_factory=dict)  # e.g. {min_lr_rate: 0.1} for cosine_with_min_lr
     precision: Literal["auto", "bf16", "fp16", "fp32"] = "auto"
     gradient_checkpointing: bool = False
     group_by_length: bool = False
@@ -81,7 +87,9 @@ class TrainArgs(BaseModel):
             kwargs["eval_steps"] = self.eval_steps
         if save_strategy == "steps":
             kwargs["save_steps"] = save_steps
-        for key in ("optim", "metric_for_best_model", "greater_is_better"):
+        if self.lr_scheduler_kwargs:
+            kwargs["lr_scheduler_kwargs"] = dict(self.lr_scheduler_kwargs)
+        for key in ("optim", "adam_beta1", "adam_beta2", "adam_epsilon", "metric_for_best_model", "greater_is_better"):
             if getattr(self, key) is not None:
                 kwargs[key] = getattr(self, key)
         if run_name:

@@ -33,7 +33,11 @@ class RewardSpec(BaseModel):
         custom     `function`: "package.module:name", called as f(completion, reference, prompt) -> float
 
     Keep `correct` dominant: a model can collect format and reasoning rewards without solving
-    anything, so those are there to shape the output, with small weights.
+    anything. `gated: true` pays a term only on completions the `correct` term accepts, which
+    removes that way out: the shaping then only chooses among right answers.
+
+    A `length` penalty is here for completeness; in the one study that isolated it, punishing
+    long completions lowered accuracy.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -41,6 +45,7 @@ class RewardSpec(BaseModel):
     kind: Literal["correct", "format", "reasoning", "length", "custom"] = "correct"
     name: str | None = None  # how the term is logged: train/rewards/<name>/mean
     weight: float = 1.0
+    gated: bool = False  # paid only when the answer is correct; needs a `correct` term among the rewards
     scorer: ScorerSpec | None = None
     pattern: str | None = None
     max_chars: int | None = None
@@ -94,17 +99,23 @@ def build_rewards(specs: Sequence[RewardSpec]) -> tuple[list[Callable[..., list[
     names = [s.name or s.kind for s in specs]
     if len(set(names)) != len(names):
         raise ValueError(f"reward names must be distinct, got {names}; set name on the repeated ones")
+    correct = next((_term(s) for s in specs if s.kind == "correct"), None)
+    if correct is None and any(s.gated for s in specs):
+        raise ValueError("a gated reward is paid only on correct answers: add a `correct` reward to gate it on")
+    if any(s.gated and s.kind == "correct" for s in specs):
+        raise ValueError("the `correct` reward cannot be gated on itself")
     functions = []
     for spec, name in zip(specs, names, strict=True):
         term = _term(spec)
 
-        def reward(prompts=None, completions=None, answer=None, _term=term, **kwargs) -> list[float]:
+        def reward(prompts=None, completions=None, answer=None, _term=term, _gated=spec.gated, **kwargs) -> list[float]:
             answers = answer if answer is not None else [""] * len(completions)
             prompts = prompts if prompts is not None else [None] * len(completions)
-            return [
-                _term(completion_text(c), "" if a is None else str(a), q)
-                for c, a, q in zip(completions, answers, prompts, strict=True)
-            ]
+            out = []
+            for c, a, q in zip(completions, answers, prompts, strict=True):
+                text, reference = completion_text(c), "" if a is None else str(a)
+                out.append(0.0 if _gated and correct(text, reference, q) < 1.0 else _term(text, reference, q))
+            return out
 
         reward.__name__ = name  # TRL logs rewards/<__name__>/mean
         functions.append(reward)

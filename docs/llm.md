@@ -5,13 +5,21 @@ It trains with Unsloth or with plain TRL and PEFT, on one GPU or several, and ca
 Axolotl or ms-swift.
 Which stages exist, their order and their defaults follow [docs/research/llm.md](research/llm.md):
 measure first, sweep the learning rate, choose the checkpoint by the task metric, add verified
-data, then post-train with preference optimisation or reinforcement learning.
+data, then post-train. Post-training has a study of its own,
+[docs/research/llm-rl.md](research/llm-rl.md): distillation, rounds of training on the model's
+own verified answers, preference optimisation, and reinforcement learning last. Which
+optimisation settings are worth a sweep is in
+[docs/research/llm-optimizer.md](research/llm-optimizer.md), and what else was considered in
+[docs/research/llm-levers.md](research/llm-levers.md).
 
 ```
 prepare_data ─┬─> eval (base) ──> eval (prompt-only)
               └─> check_data ──> sft x N (matrix) ──> select ──> select_checkpoint ──> eval
                                                         └──> generate_data ─┬─> dpo ─┐
                                                                             └────────┴─> grpo ──> eval ──> export
+
+post-training, any subset, in this order:
+  distill (teacher) ──> [generate_data ──> sft] x 2 ──> generate_data (RL prompts) ──> grpo ──> eval
 ```
 
 Every stage starts from a base model or from the `model` artifact of an earlier stage, so stages
@@ -21,7 +29,9 @@ can be left out, repeated and reordered. Example pipelines in `configs/llm/`:
 |---|---|
 | `multi-gpu.yaml` | LoRA SFT on four GPUs with the `hf` backend, and full fine-tuning with FSDP2 |
 | `other-trainers.yaml` | The same data through Axolotl and ms-swift, each on several GPUs |
-| `accuracy.yaml` | The research-driven recipe on a task with checkable answers: baselines, a learning-rate sweep, checkpoint selection, self-play, GRPO, paired evaluations |
+| `accuracy.yaml` | The research-driven recipe on a task with checkable answers: baselines, a learning-rate sweep, checkpoint selection, self-play, GRPO on the prompts worth it, paired evaluations |
+| `sweep-soup.yaml` | A learning-rate sweep over three seeds, the best configuration by its mean, its seeds averaged into one adapter and compared with a single run |
+| `post-training.yaml` | Everything after SFT: on-policy distillation from a teacher, two rounds of training on the model's own verified answers, RL in two stages on reserved questions |
 | `qwen3-multistage.yaml` | Continued pretraining, two SFT passes, DPO, export |
 | `sft-only.yaml` | The shortest useful pipeline |
 
@@ -29,16 +39,18 @@ can be left out, repeated and reordered. Example pipelines in `configs/llm/`:
 
 | Kind | What it does | Why it is there |
 |---|---|---|
-| `llm.prepare_data` | Normalises chat, raw-text and preference sources; drops invalid rows and duplicates; splits by question into train, validation (`eval`) and optionally test; mixes in general data (`replay_ratio`) | Two rows asking the same thing never sit on both sides of a split. Validation is selected on; test is only reported |
+| `llm.prepare_data` | Normalises chat, raw-text and preference sources; drops invalid rows and duplicates; splits by question into train, validation (`eval`) and optionally test and a share reserved for RL (`rl_fraction`); mixes in general data (`replay_ratio`) | Two rows asking the same thing never sit on both sides of a split. Validation is selected on; test is only reported. RL gains more on questions no earlier stage trained on |
 | `llm.check_data` | Checks the training rows for defects, duplicates, leaks into the held-out rows and private data; drops what is certainly useless, flags the rest, writes a report | Wrong answers and train/eval overlap are the two defects with a measured cost ([research](research/llm-data.md)) |
-| `llm.eval` | Generates answers and scores them with a task scorer; reports the mean with its standard error and 95 % interval; compares with another evaluation item by item (`compare_to`); optional few-shot and system-prompt baselines; optional held-out loss | A loss cannot rank models across recipes, and an unpaired comparison needs thousands of rows to see three points |
+| `llm.eval` | Generates answers and scores them with a task scorer; reports the mean with its standard error and 95 % interval; compares with another evaluation item by item (`compare_to`); optional few-shot and system-prompt baselines; optional held-out loss; with `samples_per_prompt`, also pass@k and the majority vote over sampled answers | A loss cannot rank models across recipes, and an unpaired comparison needs thousands of rows to see three points. RL can raise the single answer and lower what voting reaches |
 | `llm.cpt` | Continued pretraining on raw text, with the embeddings and output head trained at a lower learning rate | For domains whose vocabulary the base model lacks. Not in the accuracy recipe: raw-text pretraining tends to damage prompting |
 | `llm.sft` | Chat fine-tuning through the tokenizer's chat template, loss on assistant turns only, a checkpoint per epoch | The main stage. Run it as a `matrix` over the learning rate |
 | `llm.select` | The best run of a matrix by one metric; hands on that run's artifacts | The learning rate is the most sensitive setting |
+| `llm.soup` | Averages the LoRA updates of several runs into one adapter: the seeds of one configuration, or with `selected_by` the seeds of the configuration `llm.select` chose | Three seeds averaged gained 2.6 and 3.3 points over a single run in the one study that isolated it, at the inference cost of one model |
 | `llm.select_checkpoint` | Answers the validation questions with every checkpoint of a training stage and keeps the best (or, with `tolerance`, the earliest one close to the best) | Validation loss bottoms out early while answers keep improving. Before RL, a less-trained checkpoint explores more |
-| `llm.generate_data` | A model answers training prompts several times without seeing the references; a scorer sorts the answers | Verified answers to train on (from a teacher or the model itself), right/wrong pairs for DPO, and the share of prompts RL can still learn from |
-| `llm.dpo` | Direct preference optimisation on prompt / chosen / rejected | Helps at about 7B and above in the available evidence; not below |
-| `llm.grpo` | Reinforcement learning with verifiable rewards (TRL's `GRPOTrainer`): DAPO by default, also Dr. GRPO, BNPO, GRPO, CISPO, and GSPO through `importance_sampling_level: sequence` | A few points on top of SFT when answers can be checked and the model already solves part of the prompts |
+| `llm.generate_data` | A model answers training prompts several times without seeing the references; a scorer sorts the answers | Verified answers to train on (from a teacher or the model itself), right/wrong pairs for DPO, the prompts RL can still learn from, and a check of the scorer |
+| `llm.distill` | On-policy distillation (TRL's `DistillationTrainer`): the student answers the prompts itself and is pulled toward a teacher's next-token distribution on its own answers; no labels | The largest gain per GPU hour in the published recipes, when a teacher of the same family that is good at the task exists |
+| `llm.dpo` | Direct preference optimisation on prompt / chosen / rejected; `loss_type: sigmoid_norm` is the length-normalised loss | A preference stage helped at about 4B and above in the published recipes; below that it scored under plain SFT. The evidence is thin |
+| `llm.grpo` | Reinforcement learning with verifiable rewards (TRL's `GRPOTrainer`): DAPO by default, also Dr. GRPO, BNPO, GRPO, CISPO, SAPO, VESPO, LUSPO, and GSPO as `loss_type: grpo` with `importance_sampling_level: sequence` | A few points on top of SFT when answers can be checked and the model already solves part of the prompts |
 | `llm.export` | LoRA adapter, merged 16-bit or 4-bit checkpoint, GGUF; optional Hub push, private by default | Runs once, after the gates |
 | `llm.axolotl`, `llm.swift` | SFT, continued pretraining or DPO run by Axolotl's or ms-swift's command line: the stage writes the library's config, runs it, and reads back the adapter and the training log | Their multi-GPU modes and methods, without leaving the pipeline |
 
@@ -66,18 +78,124 @@ out of tokens inside its reasoning looks like.
 ```yaml
 rewards:
   - {kind: correct, scorer: {name: numeric}, weight: 1.0}
-  - {kind: format, pattern: '####\s*-?[\d,.]+\s*$', weight: 0.1}
+  - {kind: format, pattern: '####\s*-?[\d,.]+\s*$', weight: 0.1, gated: true}
 ```
 
 Kinds: `correct` (a scorer), `format` (the answer matches a pattern), `reasoning` (a closed,
 non-empty reasoning block followed by an answer), `length` (a penalty past `max_chars`), `custom`.
 Each term is logged on its own (`train/rewards/<name>/mean`); the weights combine them. Keep
-`correct` dominant: the other terms can be collected without solving anything.
+`correct` dominant: the other terms can be collected without solving anything. `gated: true`
+pays a term only on completions the `correct` term accepts, so it can only choose among right
+answers. The plainest reward, correctness alone, is what the strongest published recipes use; a
+`length` penalty lowered accuracy where it was isolated.
 
 The stage reports `train/reward_start`, `train/reward` and `train/reward_gain` (the mean reward
 over the first and last tenth of the run), so a gate can require that the run learned. The
 held-out reward is measured afterwards by `llm.eval`, which decodes greedily; TRL's own
 evaluation samples at the training temperature.
+
+### Optimisation settings
+
+What a sweep should cover, from [docs/research/llm-optimizer.md](research/llm-optimizer.md):
+
+```yaml
+- name: sft
+  kind: llm.sft
+  matrix:
+    train.learning_rate: [1.0e-4, 2.0e-4, 5.0e-4, 1.0e-3]   # the setting that matters most
+    train.gradient_accumulation_steps: [4, 16]               # effective batch 8 and 32: the best rate differs for each
+    seed: [1, 2, 3]                                          # single runs differ by up to a point
+  params: {...}
+- name: best
+  kind: llm.select
+  params: {group: sft, metric: eval/loss, average_over: [seed]}
+```
+
+Keep the cosine schedule: a constant rate was measured to be worse for SFT. Everything else on a
+`train:` block is a convention that no controlled study found to matter once the learning rate
+is tuned: the optimizer (`optim`), `warmup`, `weight_decay`, `max_grad_norm`, and Adam's
+`adam_beta1`, `adam_beta2`, `adam_epsilon`. They can be set; they are not worth sweeping.
+`lr_scheduler_kwargs` reaches the scheduler, for example `{min_lr_rate: 0.1}` with
+`lr_scheduler_type: cosine_with_min_lr`.
+
+`loraplus_lr_ratio: 16` on `llm.sft` or `llm.cpt` (with `backend: hf`) trains the B matrices at
+that multiple of the learning rate (LoRA+). It is off by default: with a tuned learning rate,
+four groups measured anything from no gain to four points. Lower the learning rate by about half
+with it.
+
+### Averaging seeds
+
+```yaml
+- name: soup
+  kind: llm.soup
+  params: {group: sft, selected_by: best}      # the seeds of the configuration `best` chose
+```
+
+The update of a LoRA layer is the product of its two matrices, so averaging the matrices of two
+runs does not average the runs. `llm.soup` writes the exact average instead: an ordinary adapter
+whose rank is the sum of the members' ranks, with no base model loaded or copied. Average runs
+of one recipe only; a plain average of runs that differ in data or recipe was measured to be
+worse than the best of them. Compare the result with a single run (`llm.eval` with
+`compare_to`) before relying on it. DoRA adapters and adapters with per-module ranks are refused.
+
+### Settings of `llm.grpo`
+
+The defaults follow [docs/research/llm-rl.md](research/llm-rl.md): `loss_type: dapo`, no KL
+penalty (`beta: 0`), sampling at temperature 1.0 without top-p, 8 generations per prompt, 64
+completions per update (8 prompts), a constant learning rate of 1e-5, 300 steps.
+
+| Setting | For |
+|---|---|
+| `train.learning_rate` | The most sensitive one. Sweep 5e-6 to 5e-5 for LoRA with `matrix`; full fine-tuning takes about a tenth |
+| `train.per_device_train_batch_size`, `train.gradient_accumulation_steps` | Their product, times the processes, is the completions per update, a multiple of `num_generations` |
+| `loss_type`, `importance_sampling_level` | The objective. The choices differ by less than seed noise at this scale |
+| `steps_per_generation`, `num_iterations` | Several updates per batch of rollouts: cheaper, and off-policy |
+| `epsilon`, `epsilon_high` | The clip range; it only acts when rollouts are reused. 0.2 and 0.28 in DAPO |
+| `scale_rewards` | Reward spread per `group`, per `batch`, or `none` |
+| `multi_objective_aggregation` | `normalize_then_sum` scales each reward term before adding them |
+| `mask_truncated_completions` | Leaves cut-off completions out of the loss. Only when few are cut off |
+| `cast_lm_head_to_fp32` | Full precision at the output layer, for long runs |
+
+### Prompts for RL
+
+`llm.generate_data` writes, next to `sft` and `preference`:
+
+- `rl`: the prompts whose pass rate lies above `rl_min_pass_rate` and below `rl_max_pass_rate`
+  (0 and 0.9), plus `rl_keep_solved` (a tenth) of the ones above. A prompt the model never
+  solves, or always solves, gives a group-relative method no gradient; cutting only one of the
+  two ends was measured to be worse than cutting neither.
+- `prompts`: every prompt with its `pass_rate`.
+- `generate/scorer_disagreement`, with `audit_scorer`: of the answers the task scorer rejected,
+  the share a more lenient scorer accepts. A reward that punishes right answers is not repaired
+  by more rollouts.
+
+The pass rates belong to the model that produced them. Measure again before a second RL stage,
+as `post-training.yaml` does; and sample the way RL will (`temperature: 1.0`, `top_p: 1.0`).
+
+### Self-training rounds
+
+`llm.generate_data` followed by `llm.sft` on its `sft` output, repeated, is the cheap alternative
+to RL: it needs no backward pass on wrong answers and reached most of GRPO's gain in the
+comparisons available. Sample each round with the newest model, train from the checkpoint the
+rounds started at, on that round's answers. Stop after two or three rounds: gate
+`generate/pass_at_k` against the round before, because that is what falls first. `prefer:
+shortest` keeps the shortest right answers, `keep_per_prompt` how many distinct ones.
+
+### Distillation
+
+```yaml
+- name: distill
+  kind: llm.distill
+  params:
+    init_from: ${sft.model}
+    teacher: your-org/larger-model-trained-on-the-task   # the same tokenizer as the student
+    train_data: ${quality.chat}                          # only the prompts are used
+    max_completion_length: 400
+    beta: 1.0                                            # 1: reverse KL, 0: forward KL, 0.5: Jensen-Shannon
+```
+
+The teacher is loaded next to the student, so both must fit in memory. A teacher that was never
+trained on the task can be worse than no teacher: evaluate after the stage and gate on it.
 
 ### What a gate can say
 
@@ -86,6 +204,9 @@ gate:
   - {metric: eval/delta_ci_low, min: 0.0}            # better than the compared model, beyond chance
   - {metric: eval/score, baseline: eval_sft.eval/score, max_drop: 0.0}
   - {metric: generate/mixed_fraction, min: 0.1}       # RL has something to learn from
+  - {metric: generate/scorer_disagreement, max: 0.05} # the scorer does not reject right answers
+  - {metric: generate/pass_at_k, baseline: selfplay_1.generate/pass_at_k, max_drop: 0.0}
+  - {metric: eval/majority_vote, baseline: eval_sft.eval/majority_vote, max_drop: 0.0}
   - {metric: train/reward_gain, min: 0.0}
   - {metric: eval/no_answer, max: 0.05}
   - {metric: eval/valid_reasoning, min: 0.95}         # with expect_reasoning: true
@@ -117,7 +238,7 @@ either is a PEFT adapter and loads in both.
 
 ## Several GPUs
 
-A training stage (`llm.cpt`, `llm.sft`, `llm.dpo`, `llm.grpo`) takes a `launch` block:
+A training stage (`llm.cpt`, `llm.sft`, `llm.dpo`, `llm.grpo`, `llm.distill`) takes a `launch` block:
 
 ```yaml
 launch: {num_processes: 4}                       # one process per GPU (DDP) under torchrun
@@ -258,7 +379,8 @@ For live dashboards set `train: {report_to: [trackio]}` (or `wandb`, `tensorboar
   and TRL. Stages ask `get_backend(name)`; tests can swap in a fake with `set_backend`.
 - `quality.py`: the data checks. `check.py`: the stage that runs them.
 - `external.py`: the Axolotl and ms-swift stages.
-- `prepare.py`, `train.py`, `evaluate.py`, `select.py`, `generate.py`, `export.py`: the stages.
+- `prepare.py`, `train.py`, `evaluate.py`, `select.py`, `generate.py`, `soup.py`, `export.py`: the stages.
+- `stagetrain/core/soup.py`: averaging full checkpoints, and the exact average of LoRA adapters.
 - `stagetrain/core/launch.py` and `stagetrain/worker.py`: launching a stage on several GPUs.
 
 ## What was verified, and how
@@ -272,6 +394,12 @@ Run for real, with the `hf` backend on a CPU (`tests/test_llm_hf.py`):
   the synthetic task and the paired evaluation shows it;
 - checkpoint selection by generated answers, self-play data generation, GRPO with TRL's
   `GRPOTrainer` and the stage's reward functions, export of the adapter and the merged model;
+- on-policy distillation with TRL's `DistillationTrainer`: an untrained student learns the task
+  from the fine-tuned model's logits, with no labels;
+- two seeds of a LoRA trained with LoRA+ and other Adam settings, averaged by `llm.soup`, the
+  averaged adapter evaluated and merged for export. That the merged average equals the mean of
+  the members' merged weights is checked tensor by tensor (`tests/test_llm_soup.py`), also for
+  members of different rank and scale;
 - a training stage in a worker process (`launch: {subprocess: true}`), start to result.
 
 Run with stand-ins (`pytest tests/test_llm_*.py`):
@@ -279,9 +407,12 @@ Run with stand-ins (`pytest tests/test_llm_*.py`):
 - data normalisation, rejection reasons, chunking, the splits and replay mixing;
 - every scorer, the standard error and the paired difference, the reward terms called the way
   TRL calls them;
-- parameters -> keyword arguments, and that `sft_config_kwargs`, `dpo_config_kwargs` and
-  `grpo_config_kwargs` build real `trl.SFTConfig`, `trl.DPOConfig` and `trl.GRPOConfig` objects
-  on the installed trl 1.18 / transformers 5.23;
+- parameters -> keyword arguments, and that `sft_config_kwargs`, `dpo_config_kwargs`,
+  `grpo_config_kwargs` and `distill_config_kwargs` build real `trl.SFTConfig`, `trl.DPOConfig`,
+  `trl.GRPOConfig` and `trl.DistillationConfig` objects on the installed trl 1.18 /
+  transformers 5.23;
+- the pass-rate band for RL prompts, gated rewards, near-miss negatives, the scorer audit, pass@k
+  and the majority vote;
 - the data checks and `llm.check_data` on rows with known defects;
 - `llm.axolotl` and `llm.swift` against a script that stands in for their commands: the config
   written, the command and environment, the data conversion, what is read back;
@@ -320,9 +451,16 @@ Not verified at all, to check on the first real run:
   as the reference; `merge` (the default) does not depend on it.
 - `GRPOConfig` field names are the same in trl 1.15 and 1.18 according to a diff of the two
   releases; the stage was checked against 1.18 only.
-- `llm.grpo`: the reward functions were called in tests the way TRL's documentation and source
-  describe (`prompts`, `completions`, extra dataset columns as keyword arguments). No GRPO step
-  was run. `fast_inference` (vLLM) was not exercised at all.
+- `llm.grpo` and `llm.distill` under Unsloth's patched trainers: no step was run with that
+  backend. `fast_inference` (vLLM) was not exercised at all. `DistillationTrainer` and the
+  `sapo`, `vespo` and `luspo` objectives were read in trl 1.18; whether the trl 1.15 that Unsloth
+  pins has them was not checked.
+- The GRPO settings beyond the defaults (`steps_per_generation`, `num_iterations`, the clip
+  range, `cast_lm_head_to_fp32`): they build a valid `GRPOConfig`; no run used them.
+- Every default taken from the RL research (learning rate, completions per update, the pass-rate
+  band): they come from papers, not from a run of this pipeline.
+- Whether averaging seeds raises accuracy here: the arithmetic is tested, the gain is one
+  paper's. `loraplus_lr_ratio` exists for the `hf` backend only.
 - `backend.sample` generates several answers with `num_return_sequences` on one prompt at a
   time. It is correct by construction but slow; batching it is the first optimisation to make.
 - Loading a `checkpoint-<step>` directory as an adapter (`llm.select_checkpoint`) relies on a

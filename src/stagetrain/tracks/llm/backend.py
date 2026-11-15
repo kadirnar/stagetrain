@@ -35,6 +35,15 @@ class LlmTrainArgs(TrainArgs):
 
     The learning rate is the setting that matters most and its best value moves with the model,
     the rank and the batch size: sweep it (a `matrix` over 5e-5 ... 1e-3) instead of trusting 2e-4.
+    The effective batch size is the second axis: its best value moves with the size of the
+    dataset, and the learning rate has to be chosen again for each batch size.
+
+    Everything else here is a convention. In the controlled comparisons found, the optimizer
+    (AdamW against Muon, Lion, Shampoo and others), warmup, weight decay, Adam's betas and the
+    clipping threshold made no measurable difference once the learning rate was tuned; a decaying
+    schedule did (cosine was better than a constant rate). `adamw_8bit` saves nothing for an
+    adapter, whose optimizer state is tiny: `adamw_torch` is the same optimizer without
+    bitsandbytes.
     """
 
     learning_rate: float = 2e-4
@@ -59,16 +68,21 @@ class DpoTrainArgs(LlmTrainArgs):
 
 
 class GrpoTrainArgs(LlmTrainArgs):
-    """One optimisation step uses `per_device_train_batch_size * gradient_accumulation_steps`
-    completions, which must be a multiple of `num_generations`."""
+    """One update uses `per_device_train_batch_size * gradient_accumulation_steps * processes`
+    completions, a multiple of `num_generations`. The defaults make that 64 completions, which
+    is 8 prompts at 8 generations each: one prompt per update, which smaller settings give, is
+    far below what any published recipe uses.
 
-    learning_rate: float = 5e-6
+    The learning rate is a constant 1e-5, the middle of what LoRA runs in the papers used
+    (5e-6 to 5e-5). Like the SFT rate it is worth a sweep."""
+
+    learning_rate: float = 1e-5
     per_device_train_batch_size: int = 8
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 8
     max_steps: int = 300  # reward rarely moves before a few hundred steps
-    lr_scheduler_type: str = "linear"
-    warmup: float = 0.1
-    weight_decay: float = 0.001
+    lr_scheduler_type: str = "constant"
+    warmup: float = 0.0
+    weight_decay: float = 0.0
     logging_steps: int = 1
     save_steps: int | None = 100
 
@@ -191,15 +205,25 @@ def sft_config_kwargs(
     packing: bool = False,
     embedding_learning_rate: float | None = None,
     bf16: bool | None = None,
+    loraplus_lr_ratio: float | None = None,
 ) -> dict[str, Any]:
     """Keyword arguments of `UnslothTrainingArguments`, which on a GPU install is TRL's `SFTConfig`
-    plus `embedding_learning_rate`. The dataset is always one rendered `text` column."""
+    plus `embedding_learning_rate`. The dataset is always one rendered `text` column.
+    `loraplus_lr_ratio` is not a library argument: the `hf` backend reads it and builds the
+    optimizer itself."""
+    if loraplus_lr_ratio is not None and embedding_learning_rate is not None:
+        raise ValueError(
+            "loraplus_lr_ratio and a separate embedding learning rate each need their own optimizer groups; "
+            "use one of them (LoRA+ is for adapters that do not train the embeddings)"
+        )
     kwargs = _trainer_kwargs(train, output_dir, seed, has_eval, run_name, bf16)
     kwargs.setdefault("dataset_text_field", "text")
     kwargs.setdefault("max_length", max_seq_length)
     kwargs.setdefault("packing", packing)
     if embedding_learning_rate is not None:
         kwargs["embedding_learning_rate"] = embedding_learning_rate
+    if loraplus_lr_ratio is not None:
+        kwargs["loraplus_lr_ratio"] = loraplus_lr_ratio
     return kwargs
 
 
@@ -225,7 +249,10 @@ def dpo_config_kwargs(
     return kwargs
 
 
-GRPO_LOSSES = ("dapo", "grpo", "dr_grpo", "bnpo", "cispo")
+GRPO_LOSSES = ("dapo", "grpo", "dr_grpo", "bnpo", "cispo", "sapo", "luspo", "vespo")
+# With one importance ratio per sequence these sum per-token terms, which weights a sequence by
+# its length instead of optimising the sequence-level objective.
+TOKEN_SUMMING_LOSSES = ("dapo", "dr_grpo", "bnpo", "cispo")
 
 
 def grpo_config_kwargs(
@@ -246,25 +273,51 @@ def grpo_config_kwargs(
     run_name: str | None = None,
     bf16: bool | None = None,
     num_processes: int = 1,
+    steps_per_generation: int | None = None,
+    num_iterations: int = 1,
+    epsilon: float | None = None,
+    epsilon_high: float | None = None,
+    scale_rewards: str | None = None,
+    multi_objective_aggregation: str | None = None,
+    cast_lm_head_to_fp32: bool = False,
 ) -> dict[str, Any]:
     """Keyword arguments of TRL's `GRPOConfig`.
 
     `loss_type` selects the objective: `dapo` (TRL's and Unsloth's default; token-level
     normalisation that removes GRPO's bias toward short completions), `dr_grpo`, `bnpo`, the
-    original `grpo`, or `cispo`. `importance_sampling_level: sequence` is GSPO. There is no
+    original `grpo`, `cispo`, `sapo`, `vespo`, or `luspo`. GSPO is `loss_type: grpo` with
+    `importance_sampling_level: sequence`; `luspo` is its length-unbiased variant. There is no
     `max_prompt_length` any more: `llm.grpo` drops over-long prompts before training.
+
+    With one update per batch of rollouts, which is the default, the importance ratio is 1 and
+    these objectives differ only in how they normalise; the choice matters once rollouts are
+    reused (`steps_per_generation` above `gradient_accumulation_steps`, or `num_iterations` above 1).
     """
     if loss_type not in GRPO_LOSSES:
         raise ValueError(f"loss_type must be one of {GRPO_LOSSES}, got {loss_type!r}")
     if importance_sampling_level not in ("token", "sequence"):
         raise ValueError("importance_sampling_level is token (GRPO) or sequence (GSPO)")
+    if importance_sampling_level == "sequence" and loss_type in TOKEN_SUMMING_LOSSES:
+        raise ValueError(
+            f"importance_sampling_level: sequence with loss_type: {loss_type} weights each sequence by its length; "
+            "GSPO is loss_type: grpo with importance_sampling_level: sequence (or loss_type: luspo)"
+        )
+    if loss_type == "luspo" and importance_sampling_level != "sequence":
+        raise ValueError("loss_type: luspo is a sequence-level loss: set importance_sampling_level: sequence")
+    if scale_rewards not in (None, "group", "batch", "none"):
+        raise ValueError("scale_rewards is group, batch or none")
+    if multi_objective_aggregation not in (None, "sum_then_normalize", "normalize_then_sum"):
+        raise ValueError("multi_objective_aggregation is sum_then_normalize or normalize_then_sum")
+    if steps_per_generation is not None and steps_per_generation % train.gradient_accumulation_steps:
+        raise ValueError("steps_per_generation must be a multiple of gradient_accumulation_steps: an update uses whole steps")
     if num_generations < 2:
         raise ValueError("num_generations must be at least 2: the advantage compares completions of one prompt")
-    step = train.per_device_train_batch_size * train.gradient_accumulation_steps * num_processes
+    steps = steps_per_generation or train.gradient_accumulation_steps
+    step = train.per_device_train_batch_size * steps * num_processes
     if step % num_generations:
         raise ValueError(
-            f"per_device_train_batch_size * gradient_accumulation_steps * processes = {step} must be a multiple "
-            f"of num_generations = {num_generations}: a step holds whole groups of completions"
+            f"per_device_train_batch_size * steps per generation * processes = {step} must be a multiple "
+            f"of num_generations = {num_generations}: a batch of rollouts holds whole groups of completions"
         )
     if not 0 < temperature < 10:
         raise ValueError("temperature must be above 0: without sampling every completion of a group is the same")
@@ -273,12 +326,52 @@ def grpo_config_kwargs(
         num_generations=num_generations, max_completion_length=max_completion_length, temperature=temperature,
         top_p=top_p, loss_type=loss_type, beta=beta, importance_sampling_level=importance_sampling_level,
     )
+    for key, value in (
+        ("steps_per_generation", steps_per_generation), ("epsilon", epsilon), ("epsilon_high", epsilon_high),
+        ("scale_rewards", scale_rewards), ("multi_objective_aggregation", multi_objective_aggregation),
+    ):
+        if value is not None:
+            kwargs[key] = value
+    if num_iterations != 1:
+        kwargs["num_iterations"] = num_iterations
+    if cast_lm_head_to_fp32:
+        kwargs["cast_lm_head_to_fp32"] = True
     if loss_type == "cispo":
         kwargs.setdefault("epsilon_high", 5.0)  # older TRL releases fall back to 0.2, which is not CISPO
     if reward_weights is not None:
         kwargs["reward_weights"] = list(reward_weights)
     if mask_truncated_completions is not None:
         kwargs["mask_truncated_completions"] = mask_truncated_completions
+    if template_kwargs:
+        kwargs["chat_template_kwargs"] = dict(template_kwargs)
+    return kwargs
+
+
+def distill_config_kwargs(
+    train: TrainArgs,
+    *,
+    output_dir: str | Path,
+    seed: int,
+    teacher: str,
+    max_completion_length: int,
+    beta: float = 1.0,
+    temperature: float = 1.0,
+    template_kwargs: dict[str, Any] | None = None,
+    run_name: str | None = None,
+    bf16: bool | None = None,
+) -> dict[str, Any]:
+    """Keyword arguments of TRL's `DistillationConfig`: on-policy distillation, where the student
+    writes the completions and is pulled toward the teacher's next-token distribution on them.
+    `beta` picks the divergence: 0 is forward KL, 0.5 the Jensen-Shannon divergence, 1 reverse KL."""
+    if not 0.0 <= beta <= 1.0:
+        raise ValueError("beta is between 0 (forward KL) and 1 (reverse KL)")
+    if temperature <= 0:
+        raise ValueError("temperature must be above 0")
+    kwargs = _trainer_kwargs(train, output_dir, seed, False, run_name, bf16)
+    kwargs.update(
+        teacher_model_name_or_path=teacher, max_completion_length=max_completion_length, beta=beta,
+        temperature=temperature,
+    )
     if template_kwargs:
         kwargs["chat_template_kwargs"] = dict(template_kwargs)
     return kwargs
@@ -510,6 +603,32 @@ class UnslothBackend:
             processing_class=tokenizer,
             reward_funcs=list(reward_funcs),
             args=GRPOConfig(**fit_config_kwargs(config_kwargs, GRPOConfig)),
+            train_dataset=Dataset.from_list(list(rows)),
+            callbacks=self._callbacks(history_dir),
+        )
+        return self._fit(trainer, config_kwargs["output_dir"], False, resume)
+
+    def train_distill(
+        self,
+        model,
+        tokenizer,
+        rows: list[dict[str, Any]],
+        config_kwargs: dict[str, Any],
+        *,
+        resume: bool = True,
+        history_dir: str | Path | None = None,
+    ) -> TrainOutput:
+        """On-policy distillation from a teacher's logits (TRL's `DistillationTrainer`). `rows`
+        hold a `prompt` (chat messages); the teacher is named in the config and loaded by TRL."""
+        import unsloth  # noqa: F401
+        from datasets import Dataset
+        from trl import DistillationConfig, DistillationTrainer
+
+        trainer = DistillationTrainer(
+            model=model,
+            processing_class=tokenizer,
+            teacher_model=config_kwargs["teacher_model_name_or_path"],
+            args=DistillationConfig(**fit_config_kwargs(config_kwargs, DistillationConfig)),
             train_dataset=Dataset.from_list(list(rows)),
             callbacks=self._callbacks(history_dir),
         )

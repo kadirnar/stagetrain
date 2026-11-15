@@ -1,0 +1,109 @@
+# The optimisation settings that were measured to matter, and the one free gain after them:
+# sweep the learning rate over several seeds, pick the configuration by its mean, and average
+# that configuration's seeds into one adapter.
+#
+#   data ──> quality ──> sft x9 (3 learning rates x 3 seeds) ──> best ──> soup ──> eval_soup ──> export
+#                                                                  └──> eval_single ──┘
+#
+#   stagetrain plan   configs/llm/sweep-soup.yaml
+#   stagetrain run    configs/llm/sweep-soup.yaml
+#   stagetrain report configs/llm/sweep-soup.yaml --open
+#
+# The evidence is in docs/research/llm-optimizer.md and docs/research/llm-levers.md. The numbers
+# in this file are starting points taken from papers, not results measured with this pipeline.
+
+track: llm
+name: qwen3-1.7b-sweep-soup
+seed: 3407
+
+vars:
+  base_model: unsloth/Qwen3-1.7B
+  generation: &generation
+    max_seq_length: 1024
+    load_in: 16bit
+    scorer: {name: numeric}
+    max_new_tokens: 400
+    chat_template_kwargs: {enable_thinking: false}
+
+defaults:
+  llm.eval:
+    <<: *generation
+    eval_data: ${data.chat_test}
+    max_samples: 1000          # a difference of three points needs about a thousand paired items to show
+    measure_loss: false
+
+stages:
+  - name: data
+    kind: llm.prepare_data
+    params:
+      chat:
+        - source: {path: openai/gsm8k, name: main, split: train, columns: {prompt: question, completion: answer}}
+          format: prompt_completion
+      eval_fraction: 0.05
+      test_fraction: 0.15
+
+  - name: quality
+    kind: llm.check_data
+    params:
+      chat: ${data.chat_train}
+      held_out: ["${data.chat_eval}", "${data.chat_test}"]
+      scorer: {name: numeric}
+
+  # 1. The sweep. The learning rate is the axis that matters; three seeds per value say how much
+  #    of a difference is noise (single LoRA runs differ by up to about a point, now and then
+  #    three). The effective batch size is the second axis worth having: add
+  #        train.gradient_accumulation_steps: [4, 8, 16]
+  #    to the matrix, since the best learning rate is different for each batch size.
+  #    What is not swept, because no controlled study found an effect once the learning rate is
+  #    tuned: the optimizer, warmup, weight decay, Adam's betas, the clipping threshold.
+  - name: sft
+    kind: llm.sft
+    matrix:
+      train.learning_rate: [2.0e-4, 5.0e-4, 1.0e-3]
+      seed: [1, 2, 3]
+    params:
+      max_seq_length: 1024
+      load_in: 16bit
+      chat_template_kwargs: {enable_thinking: false}
+      init_from: ${vars.base_model}
+      train_data: ${quality.chat}
+      eval_data: ${data.chat_eval}
+      lora: {r: 32, alpha: 32}
+      train:
+        num_train_epochs: 2
+        per_device_train_batch_size: 4
+        gradient_accumulation_steps: 4     # effective batch 16
+        lr_scheduler_type: cosine          # a decaying schedule was measured to beat a constant rate
+        warmup: 0.05
+        weight_decay: 0.0                  # what the controlled studies ran with; 0.01 changes nothing measurable
+
+  # 2. The configuration with the best mean over its seeds, not the luckiest run. If the highest
+  #    learning rate wins, extend the sweep upwards before trusting it.
+  - name: best
+    kind: llm.select
+    params: {group: sft, metric: eval/loss, average_over: [seed]}
+
+  # 3. The three seeds of that configuration, averaged into one adapter. The average of the
+  #    runs' updates is exact (the adapter's rank is the sum of theirs) and costs no training.
+  - name: soup
+    kind: llm.soup
+    params: {group: sft, selected_by: best}
+
+  # 4. The soup against a single run of the same configuration, item by item.
+  - name: eval_single
+    kind: llm.eval
+    params: {init_from: "${best.model}"}
+
+  - name: eval_soup
+    kind: llm.eval
+    params: {init_from: "${soup.model}", compare_to: "${eval_single.scores}"}
+    gate: {metric: eval/delta, min: 0.0}       # averaging did not make it worse
+
+  - name: export
+    kind: llm.export
+    params:
+      max_seq_length: 1024
+      load_in: 16bit
+      init_from: ${soup.model}
+      formats: [merged_16bit]
+    needs: [eval_soup]

@@ -59,6 +59,12 @@ class EvalParams(GenerationParams):
     few_shot_data: str | None = None  # where they come from: training rows, never the eval rows
     compare_to: str | None = None  # the `scores` artifact of another llm.eval over the same rows
     expect_reasoning: bool = False  # also report the share of answers with a valid reasoning block
+    # Above 1: also sample this many answers per question. `eval/pass_at_k` (some sample is right)
+    # shows what the model can reach at all, `eval/majority_vote` what agreement among its samples
+    # gives. RL mostly raises the greedy score toward pass@k rather than raising pass@k: measure
+    # both before and after, or sharpening will be read as new ability.
+    samples_per_prompt: int = Field(default=1, ge=1)
+    sample_temperature: float = Field(default=0.8, gt=0.0)
 
     @model_validator(mode="after")
     def _consistent(self) -> EvalParams:
@@ -120,6 +126,25 @@ def answer_rows(
     return records
 
 
+def sampled_metrics(groups: list[list[str]], rows: list[dict[str, Any]], scorer: ScorerSpec) -> dict[str, float]:
+    """From several sampled answers per question: the chance one sample is right, the share of
+    questions some sample solves, and the accuracy of the answer most samples agree on."""
+    judge = build_scorer(scorer)
+    right = solved = voted = total = 0
+    for group, row in zip(groups, rows, strict=True):
+        reference = row["messages"][-1]["content"]
+        correct = [judge(answer, reference, row) >= 1.0 for answer in group]
+        right += sum(correct)
+        total += len(group)
+        solved += any(correct)
+        # Votes are counted on the answer itself: the same answer reached by different reasoning is one answer.
+        finals = [" ".join(split_reasoning(answer)[1].lower().split()) for answer in group]
+        winner = max(set(finals), key=lambda f: (finals.count(f), -finals.index(f)))
+        voted += correct[finals.index(winner)]
+    n = len(groups)
+    return {"eval/sampled_pass_at_1": right / total, "eval/pass_at_k": solved / n, "eval/majority_vote": voted / n}
+
+
 @register("llm.eval")
 class Evaluate(Stage):
     """Task metric with its error, a paired comparison against a baseline, and held-out loss."""
@@ -178,6 +203,13 @@ class Evaluate(Stage):
             })
             if p.expect_reasoning:
                 metrics["eval/valid_reasoning"] = sum(has_valid_reasoning(s["output"]) for s in samples) / len(samples)
+            if p.samples_per_prompt > 1:
+                prompts = [build_prompt(r["messages"][:-1], examples, p.system_prompt) for r in picked]
+                groups = backend.sample(
+                    model, tokenizer, prompts, n=p.samples_per_prompt, max_new_tokens=p.max_new_tokens,
+                    temperature=p.sample_temperature, top_p=p.top_p, template_kwargs=p.chat_template_kwargs or None,
+                )
+                metrics.update(sampled_metrics(groups, picked, p.scorer))
             if p.compare_to:
                 baseline = json.loads(open(p.compare_to, encoding="utf-8").read())
                 diff = paired_difference(scores, baseline)

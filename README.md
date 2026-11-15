@@ -6,7 +6,7 @@ runs stages in order, resumes finished ones and stops at a failed quality gate.
 
 | Track | Model | Trained with | Stages | Design |
 |---|---|---|---|---|
-| `llm` | Generative LLM (LoRA / QLoRA / full) | [Unsloth](https://github.com/unslothai/unsloth), or plain TRL + PEFT; Axolotl and ms-swift through their CLIs; one or several GPUs | prepare_data → check_data → eval (baselines) → sft × N → select → select_checkpoint → generate_data → dpo / grpo → eval → export | [docs/llm.md](docs/llm.md); research: [training](docs/research/llm.md), [data quality](docs/research/llm-data.md), [libraries](docs/research/llm-libraries.md) |
+| `llm` | Generative LLM (LoRA / QLoRA / full) | [Unsloth](https://github.com/unslothai/unsloth), or plain TRL + PEFT; Axolotl and ms-swift through their CLIs; one or several GPUs | prepare_data → check_data → eval (baselines) → sft × N → select → soup (seeds) → select_checkpoint → distill → generate_data → sft (own verified answers) / dpo / grpo → eval → export | [docs/llm.md](docs/llm.md); research: [training](docs/research/llm.md), [RL and post-training](docs/research/llm-rl.md), [optimizer settings](docs/research/llm-optimizer.md), [other levers](docs/research/llm-levers.md), [data quality](docs/research/llm-data.md), [libraries](docs/research/llm-libraries.md) |
 | `decision` | Decision model in the style of [LiquidAI/d1](https://huggingface.co/LiquidAI/d1-3B): typed answers in one forward pass, no generated tokens | transformers, PEFT | build_data (with held-out sources) → train × seeds → soup → calibrate → eval → export | [docs/decision.md](docs/decision.md), [research](docs/research/decision.md) |
 | `classifiers` | Encoder text classifier, single- or multi-label | transformers | prepare_data → baseline (TF-IDF) → mlm_adapt → finetune × (model, learning rate, seed) → select → calibrate → eval → export; label audit and ensemble distillation as a second recipe | [docs/classifiers.md](docs/classifiers.md), [research](docs/research/classifiers.md) |
 | `embeddings` | Text embedding model (bi-encoder) | sentence-transformers | prepare_data → bm25 and untuned baselines → mine_negatives (strong embedder) → finetune × N → select → merge → eval → export | [docs/embeddings.md](docs/embeddings.md), [research](docs/research/embeddings.md) |
@@ -120,6 +120,8 @@ Example configs:
 | llm | `configs/llm/multi-gpu.yaml` | LoRA SFT on four GPUs without Unsloth; full fine-tuning with FSDP2 |
 | llm | `configs/llm/other-trainers.yaml` | the same data through Axolotl and ms-swift |
 | llm | `configs/llm/accuracy.yaml` | the research-driven recipe: baselines, a learning-rate sweep, checkpoint selection, self-play, GRPO, paired evaluations |
+| llm | `configs/llm/sweep-soup.yaml` | a learning-rate sweep over three seeds, the best configuration's seeds averaged into one adapter |
+| llm | `configs/llm/post-training.yaml` | after SFT: on-policy distillation, two self-training rounds, RL in two stages on reserved questions |
 | llm | `configs/llm/qwen3-multistage.yaml` | CPT, two SFT passes, DPO, eval, export |
 | llm | `configs/llm/sft-only.yaml` | the shortest useful pipeline |
 | decision | `configs/decision/d1-style.yaml` | a d1-style model on 14 public datasets, three seeds, calibrated and judged on three held-out datasets |
@@ -209,7 +211,7 @@ tests/
 
 ## What has been verified
 
-The test suite (274 tests) runs on CPU in under a minute and downloads nothing:
+The test suite (291 tests) runs on CPU in under a minute and downloads nothing:
 
 ```bash
 pip install -e ".[decision,classifiers,embeddings,dev]"
@@ -222,8 +224,8 @@ pytest
 - **decision, classifiers, embeddings**: the real stages run end to end on tiny random models
   built inside the tests, through the same `Pipeline` a real run uses.
 - **llm**: the stages run end to end on a tiny random model with the `hf` backend (transformers,
-  PEFT and TRL): SFT, checkpoint selection, self-play, GRPO, export, and a stage in a worker
-  process. The Unsloth backend was not run: its calls were written against the Unsloth source and
+  PEFT and TRL): SFT, checkpoint selection, self-play, GRPO, on-policy distillation, LoRA+, the
+  average of several seeds' adapters, export, and a stage in a worker process. The Unsloth backend was not run: its calls were written against the Unsloth source and
   are driven in the tests through a stand-in. `llm.axolotl` and `llm.swift` are tested against a
   script standing in for those commands. The data checks are tested on rows with known defects.
   See [docs/llm.md](docs/llm.md) for what that leaves unchecked.

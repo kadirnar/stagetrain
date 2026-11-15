@@ -58,6 +58,7 @@ stages:
           replay_ratio: 0.05
       eval_fraction: 0.05
       test_fraction: 0.12
+      rl_fraction: 0.25        # questions kept for RL: no SFT stage trains on them
       max_eval: 1000
 
   # Data quality: rows that are certainly useless are dropped (empty, looping, echoing the prompt,
@@ -118,6 +119,7 @@ stages:
     params:
       init_from: ${pick.model}
       compare_to: ${eval_prompted.scores}
+      samples_per_prompt: 8                       # also pass@8 and the majority vote, to compare after RL
     gate:
       - {metric: eval/delta_ci_low, min: 0.0}     # better than the prompted base model, beyond chance
       - {metric: eval/no_answer, max: 0.05}       # answers are not being cut off
@@ -128,22 +130,29 @@ stages:
     kind: llm.select_checkpoint
     params: {init_from: "${best_lr.checkpoints}", tolerance: 0.02}
 
-  # 6. The model answers each training question eight times. The share of questions it solves
-  #    sometimes but not always is what RL can work on; near zero, RL has nothing to learn from.
+  # 6. The model answers each question reserved for RL eight times. RL is then run on the
+  #    questions it solves sometimes: neither the ones it never solves nor those it solves nine
+  #    times in ten teach it anything, and cutting only one of the two ends was measured to be
+  #    worse than cutting neither. A tenth of the always-solved ones stays in.
   - name: selfplay
     kind: llm.generate_data
     params:
       <<: *generation
       init_from: ${rl_init.model}
-      data: ${quality.chat}
-      max_samples: 1000
+      data: ${data.chat_rl}
       samples_per_prompt: 8
-      temperature: 0.8
-    gate: {metric: generate/mixed_fraction, min: 0.1}
+      temperature: 1.0                   # measured the way RL will sample
+      top_p: 1.0
+      audit_scorer: {name: contains}     # right answers the numeric scorer rejects would poison the reward
+    gate:
+      - {metric: generate/mixed_fraction, min: 0.1}       # RL has something to work on
+      - {metric: generate/scorer_disagreement, max: 0.05}
 
-  # 7. Preference optimisation on the model's own right and wrong answers. In the one controlled
-  #    comparison it scored below plain SFT at 1.5B and 7 to 9 points above it at 7B, so it is off
-  #    for this model: enable it, and start grpo from it, when the base model is 7B or larger.
+  # 7. Preference optimisation on the model's own right and wrong answers. Evidence for it is
+  #    thin and mixed: one study found it below plain SFT at 1.5B and above it at 7B, with weak
+  #    controls. It is off here; with a model of 7B or more, enable it and start grpo from it.
+  #    `loss_type: sigmoid_norm` is the length-normalised DPO loss, the one variant with a
+  #    published gain over the SFT model it started from.
   - name: dpo
     kind: llm.dpo
     enabled: false
@@ -152,23 +161,24 @@ stages:
       init_from: ${rl_init.model}
       train_data: ${selfplay.preference}
       beta: 0.1
+      loss_type: sigmoid_norm
 
-  # 8. GRPO with the DAPO objective. The reward is the scorer's verdict; the small format term
-  #    only keeps the final line parseable.
+  # 8. GRPO with the DAPO objective, no KL penalty, a constant learning rate, and eight prompts
+  #    (64 completions) per update: the stage's defaults. The reward is the scorer's verdict. The
+  #    format term is paid only on correct answers, so it cannot be collected instead of solving.
+  #    The learning rate is worth a sweep over 5e-6 to 5e-5.
   - name: grpo
     kind: llm.grpo
-    needs: [selfplay]
     params:
       <<: *training
       init_from: ${rl_init.model}
-      train_data: ${quality.chat}
+      train_data: ${selfplay.rl}
       rewards:
         - {kind: correct, scorer: {name: numeric}, weight: 1.0}
-        - {kind: format, pattern: '####\s*-?[\d,.]+\s*$', weight: 0.1}
+        - {kind: format, pattern: '####\s*-?[\d,.]+\s*$', weight: 0.1, gated: true}
       num_generations: 8
       max_completion_length: 400
-      loss_type: dapo
-      train: {learning_rate: 5.0e-6, per_device_train_batch_size: 8, max_steps: 500, save_steps: 100}
+      train: {learning_rate: 1.0e-5, max_steps: 500, save_steps: 100}
     gate: {metric: train/reward_gain, min: 0.0}
 
   # 9. The held-out reward, decoded greedily, question by question against the model RL started from.
@@ -177,6 +187,7 @@ stages:
     params:
       init_from: ${grpo.model}
       compare_to: ${eval_sft.scores}
+      samples_per_prompt: 8          # if pass@8 did not move, RL sharpened what the model could already sample
     gate: {metric: eval/score, baseline: eval_sft.eval/score, max_drop: 0.0}
 
   - name: export

@@ -340,6 +340,10 @@ def expand_matrix(stages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], d
         selects = str(stage.get("kind", "")).endswith(".select")
         if isinstance(group, str) and (group in groups or selects) and group not in needs:
             needs.append(group)
+        # ... and, narrowed to what a select stage chose (`selected_by: <select stage>`), on that stage too.
+        selected_by = (stage.get("params") or {}).get("selected_by")
+        if isinstance(selected_by, str) and selected_by not in needs:
+            needs.append(selected_by)
         expanded: list[str] = []
         for dep in needs:
             expanded.extend(groups.get(dep, [dep]))
