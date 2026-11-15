@@ -1,0 +1,76 @@
+# Multi-label emotion classifier (28 labels, several per text) on a multilingual encoder:
+#
+#   data -> finetune -> calibration -> test -> export
+#
+# The shortest useful multi-label pipeline: no domain adaptation, no self-training. Calibration
+# also picks a decision threshold per label, which matters more than the temperature here.
+track: classifiers
+name: xlmr-go-emotions
+seed: 42
+
+vars:
+  base_model: FacebookAI/xlm-roberta-base
+  dataset: google-research-datasets/go_emotions
+  max_length: 128
+
+stages:
+  - name: data
+    kind: classifiers.prepare_data
+    params:
+      problem_type: multi_label
+      # the `labels` column is a list of class ids; their names come from the dataset's features
+      train: {path: "${vars.dataset}", name: simplified, split: train}
+      eval: {path: "${vars.dataset}", name: simplified, split: validation}
+      test: {path: "${vars.dataset}", name: simplified, split: test}
+    gate: {metric: n_labels, min: 2}
+
+  - name: finetune
+    kind: classifiers.finetune
+    params:
+      init_from: ${vars.base_model}
+      labels: ${data.labels}
+      train_data: ${data.train}
+      eval_data: ${data.eval}
+      max_length: ${vars.max_length}
+      loss: focal             # focal BCE: rare labels are not drowned by easy negatives
+      focal_gamma: 2.0        # alternative: `loss: ce` with `class_weights: balanced` (BCE pos_weight)
+      llrd: 0.9
+      head_lr_multiplier: 5
+      train:
+        learning_rate: 2.0e-5
+        num_train_epochs: 4
+        per_device_train_batch_size: 32
+        per_device_eval_batch_size: 128
+        warmup: 0.06
+        group_by_length: true
+        load_best_model_at_end: true
+        metric_for_best_model: eval_micro_f1
+        greater_is_better: true
+    gate: {metric: eval/micro_f1, min: 0.3}   # at threshold 0.5, before calibration; a sanity floor
+
+  - name: calibration
+    kind: classifiers.calibrate
+    params:
+      model: ${finetune.model}
+      data: ${data.eval}
+      max_length: ${vars.max_length}
+      fit_thresholds: true
+
+  - name: test
+    kind: classifiers.eval
+    params:
+      model: ${finetune.model}
+      calibration: ${calibration.calibration}
+      data: ${data.test}
+      max_length: ${vars.max_length}
+    gate:   # floors to adjust once you have a first run; they are not measured results
+      - {metric: eval/micro_f1, min: 0.45}
+      - {metric: eval/macro_f1, min: 0.35}
+
+  - name: export
+    kind: classifiers.export
+    needs: [test]
+    params:
+      model: ${finetune.model}
+      calibration: ${calibration.calibration}
+      max_length: ${vars.max_length}

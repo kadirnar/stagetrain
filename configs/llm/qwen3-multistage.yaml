@@ -1,0 +1,134 @@
+# Multi-stage Unsloth fine-tuning of a small chat model.
+#
+#   data ─┬─> cpt ──> sft_broad ──> sft_domain ──> dpo ──> eval ──> export
+#         └─> eval_base (the untouched base model, as the bar the trained model must clear)
+#
+#   stagetrain plan configs/llm/qwen3-multistage.yaml
+#   stagetrain run  configs/llm/qwen3-multistage.yaml
+#   stagetrain run  configs/llm/qwen3-multistage.yaml --from sft_domain --set sft_domain.train.learning_rate=5e-5
+#
+# The local files under data/ are yours to provide; the two Hub datasets are read as a stream,
+# so only `max_samples` rows are fetched.
+
+track: llm
+name: qwen3-0.6b-multistage
+seed: 3407
+
+vars:
+  base_model: unsloth/Qwen3-0.6B
+  max_seq_length: 2048
+
+defaults:
+  llm.sft:
+    max_seq_length: ${vars.max_seq_length}
+    load_in: 4bit
+    lora: {r: 16, alpha: 16}
+    train:
+      per_device_train_batch_size: 2
+      gradient_accumulation_steps: 4
+      warmup: 0.05
+      logging_steps: 10
+  llm.eval:
+    max_seq_length: ${vars.max_seq_length}
+    eval_data: ${data.chat_eval}
+    max_samples: 300
+    generate_samples: 20
+
+stages:
+  # 1. Everything the later stages read, normalised once: chat rows, raw text, preference pairs.
+  - name: data
+    kind: llm.prepare_data
+    params:
+      chat:
+        - source: {path: mlabonne/FineTome-100k, streaming: true, max_samples: 20000}
+          format: sharegpt
+        - source: {path: data/domain_chat.jsonl}          # {"messages": [{"role": ..., "content": ...}]}
+          format: messages
+          system: You are a concise assistant for our product.
+      text:
+        - source: {path: data/domain_corpus.jsonl}         # {"text": "..."}
+          chunk_chars: 6000
+          chunk_overlap: 200
+      preference:
+        - source: {path: trl-lib/ultrafeedback_binarized, streaming: true, max_samples: 5000}
+      eval_fraction: 0.02
+      max_eval: 500
+      max_chars: 24000
+
+  # The base model on the held-out chat rows: the reference for the gates below.
+  - name: eval_base
+    kind: llm.eval
+    params:
+      init_from: ${vars.base_model}
+      generate_samples: 0
+
+  # 2. Continued pretraining: the domain's vocabulary and facts, from raw text. The embeddings
+  #    and the output head are trained too, ten times slower than the LoRA weights.
+  - name: cpt
+    kind: llm.cpt
+    params:
+      init_from: ${vars.base_model}
+      max_seq_length: ${vars.max_seq_length}
+      train_data: ${data.text_train}
+      eval_data: ${data.text_eval}
+      lora: {r: 128, alpha: 32, use_rslora: true}
+      train_embeddings: true
+      train: {learning_rate: 5.0e-5, num_train_epochs: 1, per_device_train_batch_size: 2, gradient_accumulation_steps: 8}
+
+  # 3. Broad instruction tuning. `merge` folds the pretraining adapter into the weights first, so
+  #    this stage trains a small fresh adapter and the embeddings stay as pretraining left them.
+  - name: sft_broad
+    kind: llm.sft
+    params:
+      init_from: ${cpt.model}
+      on_adapter: merge
+      train_data: ${data.chat_train}
+      eval_data: ${data.chat_eval}
+      max_eval_samples: 300
+      train: {learning_rate: 2.0e-4, num_train_epochs: 1, eval_steps: 200}
+    gate: {metric: eval/loss, baseline: eval_base.eval/loss, max_rise: 0.0}
+
+  # 4. Domain instruction tuning: the same adapter, trained on with a lower learning rate.
+  - name: sft_domain
+    kind: llm.sft
+    params:
+      init_from: ${sft_broad.model}
+      on_adapter: continue
+      train_data: data/domain_chat_curated.jsonl
+      eval_data: ${data.chat_eval}
+      max_eval_samples: 300
+      train: {learning_rate: 5.0e-5, num_train_epochs: 2, eval_steps: 100}
+    gate: {metric: eval/loss, baseline: sft_broad.eval/loss, max_rise: 0.05}
+
+  # 5. Preference alignment on chosen / rejected answers. The supervised adapter is merged first
+  #    (the default for llm.dpo), so the policy DPO is measured against is exactly sft_domain.
+  - name: dpo
+    kind: llm.dpo
+    params:
+      init_from: ${sft_domain.model}
+      on_adapter: merge
+      max_seq_length: ${vars.max_seq_length}
+      train_data: ${data.preference_train}
+      eval_data: ${data.preference_eval}
+      beta: 0.1
+      train: {learning_rate: 5.0e-6, num_train_epochs: 1, per_device_train_batch_size: 2, gradient_accumulation_steps: 4}
+
+  # 6. The final model must still beat the base model on held-out chat, and not have lost more
+  #    than a little of what the supervised stages reached.
+  - name: eval
+    kind: llm.eval
+    params:
+      init_from: ${dpo.model}
+    gate:
+      - {metric: eval/loss, baseline: eval_base.eval/loss, max_rise: 0.0}
+      - {metric: eval/loss, baseline: sft_domain.eval/loss, max_rise: 0.10}
+
+  # 7. Export. Nothing is uploaded unless push_to_hub names a repository.
+  - name: export
+    kind: llm.export
+    needs: [eval]
+    params:
+      init_from: ${dpo.model}
+      max_seq_length: ${vars.max_seq_length}
+      formats: [lora, merged_16bit, gguf]
+      gguf_quantization: [q4_k_m, q8_0]

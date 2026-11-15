@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stagetrain"
+version = "0.1.0"
+description = "Multi-stage training pipelines for LLMs (Unsloth), decision models, classifiers and embedding models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Every track is independent: install only the extra you train with.
+llm = [
+    "unsloth",
+    "trl",
+    "peft",
+    "transformers",
+    "datasets",
+    "accelerate",
+]
+decision = [
+    "torch",
+    "transformers",
+    "peft",
+    "datasets",
+    "accelerate",
+    "safetensors",
+]
+classifiers = [
+    "torch",
+    "transformers",
+    "datasets",
+    "accelerate",
+    "numpy",
+]
+embeddings = [
+    "torch",
+    "sentence-transformers",
+    "datasets",
+    "accelerate",
+]
+# Optional: `export.onnx: true` in the classifiers track.
+onnx = [
+    "onnx",
+    "onnxscript",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "scikit-learn",  # the tests check the classifiers' numpy metrics against it
+]
+
+[project.scripts]
+stagetrain = "stagetrain.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stagetrain"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "torch: needs torch and the track's training libraries (tiny random models, no downloads)",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

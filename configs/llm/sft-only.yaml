@@ -1,0 +1,40 @@
+# The shortest useful pipeline: one supervised stage on your own chat data, evaluated and exported.
+#
+#   stagetrain run configs/llm/sft-only.yaml --set vars.base_model=unsloth/Qwen3-0.6B
+
+track: llm
+name: sft-only
+seed: 3407
+
+vars:
+  base_model: unsloth/Qwen3-0.6B
+  chat_data: data/chat.jsonl          # {"messages": [...]} per line; see docs/llm.md for other formats
+
+stages:
+  - name: data
+    kind: llm.prepare_data
+    params:
+      chat:
+        - source: {path: "${vars.chat_data}"}
+      eval_fraction: 0.05
+
+  - name: sft
+    kind: llm.sft
+    params:
+      init_from: ${vars.base_model}
+      train_data: ${data.chat_train}
+      eval_data: ${data.chat_eval}
+      train: {num_train_epochs: 3, learning_rate: 2.0e-4}
+
+  - name: eval
+    kind: llm.eval
+    params:
+      init_from: ${sft.model}
+      eval_data: ${data.chat_eval}
+
+  - name: export
+    kind: llm.export
+    needs: [eval]
+    params:
+      init_from: ${sft.model}
+      formats: [merged_16bit]

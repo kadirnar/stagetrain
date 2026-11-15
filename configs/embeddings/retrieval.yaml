@@ -1,0 +1,131 @@
+# Embedding track, full recipe: a plain encoder becomes a retrieval model in two training stages.
+#
+#   data_weak ─► pretrain ─┬─► mine ─► finetune ─► eval ─► export
+#   data_sup ──────────────┴──────────────┘
+#
+# pretrain   weakly-supervised contrastive pre-training on many (question, answer) pairs,
+#            in-batch negatives only, large batches through gradient caching
+# mine       the pre-trained model searches the supervised corpus for hard negatives
+# finetune   supervised fine-tuning on those negatives, with Matryoshka dimensions
+#
+#   stagetrain plan configs/embeddings/retrieval.yaml
+#   stagetrain run  configs/embeddings/retrieval.yaml
+#   stagetrain run  configs/embeddings/retrieval.yaml --set vars.base_model=<encoder> --set vars.weak_pairs=200000
+
+track: embeddings
+name: modernbert-retrieval
+seed: 42
+
+vars:
+  base_model: answerdotai/ModernBERT-base
+  max_seq_length: 512
+  weak_pairs: 1000000
+  dims: [768, 512, 256, 128, 64]
+
+stages:
+  - name: data_weak
+    kind: embeddings.prepare_data
+    params:
+      sources:
+        - path: sentence-transformers/gooaq
+          columns: {query: question, positive: answer}
+          shuffle: true
+          max_samples: ${vars.weak_pairs}
+      min_chars: 8
+      max_chars: 4000
+    gate: {metric: data/train_pairs, min: 100000}
+
+  - name: data_sup
+    kind: embeddings.prepare_data
+    params:
+      sources:
+        - path: sentence-transformers/natural-questions
+          columns: {query: query, positive: answer}
+      eval_fraction: 0.02          # split by query hash: no eval query is ever trained on
+      max_eval_queries: 2000
+      max_eval_distractors: 100000 # training documents that make the eval corpus harder
+      min_chars: 8
+      max_chars: 4000
+
+  - name: pretrain
+    kind: embeddings.pretrain
+    params:
+      init_from: ${vars.base_model}
+      train_data: ${data_weak.train}
+      eval_set: ${data_sup.eval_set}
+      encoder:
+        pooling: mean
+        max_seq_length: ${vars.max_seq_length}
+      loss:
+        name: cached_mnrl          # contrastive batch of 512, encoded 64 at a time
+        mini_batch_size: 64
+      batch_sampler: no_duplicates
+      train:
+        learning_rate: 1.0e-4
+        num_train_epochs: 1
+        per_device_train_batch_size: 512
+        warmup: 0.05
+        logging_steps: 50
+        eval_steps: 500
+        save_total_limit: 2
+    gate: {metric: eval/ndcg@10, min: 0.2}   # a floor: stop here if pre-training learned nothing
+
+  - name: mine
+    kind: embeddings.mine_negatives
+    params:
+      model: ${pretrain.model}
+      train_data: ${data_sup.train}
+      corpus: ${data_sup.corpus}
+      num_negatives: 5
+      range_min: 10                # skip the nearest ranks, where unlabeled positives sit
+      range_max: 100
+      relative_margin: 0.05        # drop candidates scoring within 5% of the positive (likely false negatives)
+      batch_size: 256
+    gate: {metric: mine/kept_fraction, min: 0.5}
+
+  - name: finetune
+    kind: embeddings.finetune
+    params:
+      init_from: ${pretrain.model}
+      train_data: ${mine.train}
+      eval_pairs: ${data_sup.eval_pairs}
+      eval_set: ${data_sup.eval_set}
+      eval_dims: [256, 64]
+      loss:
+        name: mnrl
+        matryoshka_dims: ${vars.dims}
+      batch_sampler: no_duplicates
+      train:
+        learning_rate: 2.0e-5
+        num_train_epochs: 2
+        per_device_train_batch_size: 64
+        warmup: 0.1
+        logging_steps: 20
+        eval_steps: 250
+        save_total_limit: 2
+        load_best_model_at_end: true
+        metric_for_best_model: eval_ir_cosine_ndcg@10
+        greater_is_better: true
+    gate:                          # fine-tuning must not end below the model it started from
+      metric: eval/ndcg@10
+      baseline: pretrain.eval/ndcg@10
+      max_drop: 0.0
+
+  - name: eval
+    kind: embeddings.eval
+    params:
+      model: ${finetune.model}
+      eval_set: ${data_sup.eval_set}
+      dims: [256, 64]
+      recall_at: [1, 10, 100]
+    gate:
+      - {metric: eval/ndcg@10, baseline: pretrain.eval/ndcg@10, max_drop: 0.0}
+      - {metric: eval/dim256/ndcg@10, baseline: finetune.eval/ndcg@10, max_drop: 0.05}  # cost of truncating to 256
+
+  - name: export
+    kind: embeddings.export
+    needs: [eval]                  # only a model that passed evaluation is exported
+    params:
+      model: ${finetune.model}
+      normalize: true
+      onnx: false
